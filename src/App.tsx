@@ -8,17 +8,33 @@ import { SystemStateProvider } from './contexts/SystemStateContext';
 import { useLoading } from './contexts/LoadingContext';
 import { AppPageLoadingSplash } from './components/common/AppPageLoadingSplash';
 import ReloadRequiredBanner from './components/common/ReloadRequiredBanner';
+import StartupSelfCheckBanner from './components/StartupSelfCheckBanner';
+import FirstRunWizard from './components/FirstRunWizard';
+import DocumentIndexingStatusPanel from './components/DocumentIndexingStatusPanel';
 import YueliCopilot from './components/YueliCopilot';
 import SkillManager from './components/SkillManager';
 import CheckboxTest from './components/CheckboxTest';
 import SkillManagerTest from './components/SkillManagerTest';
 import DebugPanel from './components/DebugPanel';
+import DesktopDevBar, {
+  isDesktopDevBarVisible,
+  setDesktopDevBarVisible
+} from './components/DesktopDevBar';
 import { debugManager } from './services/DebugManager';
 import styled from 'styled-components';
 
-const AppContainer = styled.div`
+const Shell = styled.div`
+  display: flex;
+  flex-direction: column;
   width: 100%;
   height: 100vh;
+  overflow: hidden;
+`;
+
+const AppContainer = styled.div`
+  flex: 1;
+  min-height: 0;
+  width: 100%;
   overflow: hidden;
 `;
 
@@ -28,6 +44,9 @@ const AppContent: React.FC = () => {
   const [debugModeEnabled, setDebugModeEnabled] = useState(debugManager.isEnabledFlag());
   const [debugPanelOpen, setDebugPanelOpen] = useState(false); // Debug 窗口默认收起
   const [debugEntries, setDebugEntries] = useState(debugManager.getEntries());
+  const [desktopDevBar, setDesktopDevBar] = useState(
+    () => Boolean(typeof window !== 'undefined' && window.yueliDesktop && isDesktopDevBarVisible())
+  );
 
   useEffect(() => {
     // 模拟页面加载
@@ -52,15 +71,20 @@ const AppContent: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    // 监听 debugManager 状态变化
-    const checkDebugMode = () => {
-      setDebugModeEnabled(debugManager.isEnabledFlag());
+    const syncDebugMode = (enabled: boolean) => {
+      setDebugModeEnabled(enabled);
+      if (typeof window !== 'undefined' && window.yueliDesktop) {
+        setDesktopDevBar(enabled && isDesktopDevBarVisible());
+      }
+      if (!enabled) {
+        setDebugPanelOpen(false);
+      }
     };
-    
-    // 每 100ms 检查一次（简单实现）
-    const interval = setInterval(checkDebugMode, 100);
-    
-    return () => clearInterval(interval);
+
+    syncDebugMode(debugManager.isEnabledFlag());
+    const unsubscribe = debugManager.subscribeState(syncDebugMode);
+
+    return () => { unsubscribe(); };
   }, []);
 
   useEffect(() => {
@@ -89,7 +113,16 @@ const AppContent: React.FC = () => {
   );
 
   return (
-    <AppContainer>
+    <Shell>
+      {debugModeEnabled && desktopDevBar && (
+        <DesktopDevBar
+          onHide={() => {
+            setDesktopDevBarVisible(false);
+            setDesktopDevBar(false);
+          }}
+        />
+      )}
+      <AppContainer>
       <Router future={{ v7_startTransition: true, v7_relativeSplatPath: true }}>
         <Suspense fallback={<AppPageLoadingSplash variant="route" />}>
           <Routes>
@@ -101,8 +134,15 @@ const AppContent: React.FC = () => {
           </Routes>
         </Suspense>
       </Router>
-      <Toaster position="bottom-right" />
+      <Toaster
+        position="bottom-center"
+        containerStyle={{ bottom: 72, zIndex: 1300 }}
+        toastOptions={{ style: { maxWidth: 'min(520px, calc(100vw - 36px))' } }}
+      />
       <ReloadRequiredBanner />
+      <DocumentIndexingStatusPanel />
+      <StartupSelfCheckBanner />
+      <FirstRunWizard />
       {debugModeEnabled && (
         <DebugPanel 
           isOpen={debugPanelOpen} 
@@ -110,7 +150,8 @@ const AppContent: React.FC = () => {
           entries={debugEntries} 
         />
       )}
-    </AppContainer>
+      </AppContainer>
+    </Shell>
   );
 };
 

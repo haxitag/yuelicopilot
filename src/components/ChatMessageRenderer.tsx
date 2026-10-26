@@ -1,11 +1,14 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import styled from 'styled-components';
-import { Message, InferenceResult, ToolCallRecord, ThinkingRecord } from '../types';
+import { Message, InferenceResult, ToolCallRecord } from '../types';
+import { coerceKgmStreamTextChunk } from '../services/chat/kgmAssistantContent';
 import InferenceResultRenderer from './InferenceResultRenderer';
-import MarkdownRenderer from './MarkdownRenderer';
+import DeckMarkdownRenderer from './deck-render/DeckMarkdownRenderer';
 import { HtmlRenderer, JsonRenderer } from './TemplateOutputRenderer';
 import { CopyOutlined, CheckOutlined, EditOutlined, SendOutlined, CloseOutlined } from '@ant-design/icons';
 import ExecutionTimelineView from './chat/ExecutionTimeline';
+import CollapsibleUserMessageBody from './chat/CollapsibleUserMessageBody';
+import { devDebug } from '../utils/devConsole';
 
 interface ChatMessageRendererProps {
   message: Message;
@@ -21,12 +24,16 @@ interface ChatMessageRendererProps {
 
 const MessageContainer = styled.div<{ $isBot: boolean }>`
   display: flex;
-  flex-direction: ${props => props.$isBot ? 'flex-start' : 'flex-end'};
-  margin-bottom: 5px;
+  flex-direction: ${(props) => (props.$isBot ? 'flex-start' : 'flex-end')};
+  margin-bottom: 12px;
+  min-width: 0;
+  width: 100%;
 `;
 
 const MessageWrapper = styled.div<{ $isBot: boolean }>`
-  max-width: ${props => props.$isBot ? '90%' : '75%'};
+  max-width: ${(props) => (props.$isBot ? 'min(90%, 100%)' : 'min(75%, 100%)')};
+  min-width: 0;
+  flex-shrink: 1;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -75,19 +82,26 @@ const ActionButton = styled.button<{ $isBot?: boolean }>`
   }
 `;
 
-const MessageContent = styled.div<{ $isBot: boolean, $isThinking: boolean }>`
-  padding: 5px 8px;
-  border-radius: 4px;
-  background-color: ${props => props.$isBot ? '#f5f5f5' : '#e6f7ff'};
-  color: ${props => props.$isBot ? '#333333' : '#333333'};
-  font-size: 13px;
-  line-height: 1.4;
-  white-space: pre-wrap;
+const MessageContent = styled.div<{ $isBot: boolean; $isThinking: boolean }>`
+  padding: ${(props) => (props.$isThinking ? '8px 12px' : '12px 16px')};
+  border-radius: 8px;
+  background-color: ${(props) => (props.$isBot ? '#fafafa' : '#e8f4ff')};
+  color: ${(props) => (props.$isBot ? '#1f2937' : '#1f2937')};
+  font-size: 14px;
+  line-height: 1.68;
+  /* 与 Markdown 块级元素并存时勿用 pre-wrap，否则易与内部 pre/table 冲突导致整段不可读 */
+  white-space: ${(props) => (props.$isThinking ? 'pre-wrap' : 'normal')};
   word-break: break-word;
+  overflow-wrap: anywhere;
   position: relative;
-  max-height: ${props => props.$isThinking ? '40px' : 'none'};
-  overflow: ${props => props.$isThinking ? 'hidden' : 'visible'};
-  ${props => props.$isThinking && `
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  /* 流式阶段 message.isThinking 仍为 true；正文在气泡内展示，勿限高（思考链已迁至执行日志） */
+  overflow-y: visible;
+  ${(props) =>
+    props.$isThinking &&
+    `
     font-style: italic;
     color: #666666;
   `}
@@ -128,6 +142,8 @@ const InferenceResultsContainer = styled.div`
   display: flex;
   flex-direction: column;
   gap: 12px;
+  min-width: 0;
+  max-width: 100%;
 `;
 
 const MessageTime = styled.div<{ $isBot: boolean }>`
@@ -217,7 +233,7 @@ const ExecutionLogContainer = styled.div<{ $isBot: boolean }>`
   background-color: ${props => props.$isBot ? '#f8f9fa' : '#fff3e6'};
   border-radius: 6px;
   border-left: 3px solid #1890ff;
-  margin-bottom: 8px;
+  margin: 0 0 12px;
   font-size: 13px;
   line-height: 1.5;
 `;
@@ -280,6 +296,47 @@ const FinalStatus = styled.div`
   margin-top: 8px;
 `;
 
+/** 思考/推理正文：限定约 5 行高度，块内滚动，避免流式撑满整页导致布局抖动 */
+const ThinkingScrollBody = styled.div`
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.42;
+  max-height: calc(12px * 1.42 * 5);
+  overflow-x: auto;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  overscroll-behavior: contain;
+  border-radius: 4px;
+  padding: 6px 8px;
+  background: #fafafa;
+  border: 1px solid #e8e8e8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  color: #555;
+`;
+
+type ThinkingPinnedScrollProps = {
+  /** 展示的完整快照文本（通常为流式递增的累计快照） */
+  text: string;
+};
+
+/**
+ * 流式更新时将滚动条固定在底部附近，等价于 Terminal follow：内容在可视「窗口」内刷新，
+ * 不继续撑高外层布局。
+ */
+const ThinkingPinnedScroll: React.FC<ThinkingPinnedScrollProps> = ({ text }) => {
+  const boxRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [text]);
+
+  return <ThinkingScrollBody ref={boxRef}>{text}</ThinkingScrollBody>;
+};
+
 const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({ 
   message, 
   onEdit,
@@ -289,12 +346,26 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
   const isBot = message.role === 'bot';
   const [copied, setCopied] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
-  const [editContent, setEditContent] = useState(message.content);
+  const rawContentStr =
+    typeof message.content === 'string'
+      ? message.content
+      : message.content != null
+        ? coerceKgmStreamTextChunk(message.content)
+        : '';
+  // 正文展示走 yueli-deck 分块渲染链（DeckMarkdownRenderer），不在此做 gfm-lite
+  const contentStr = rawContentStr;
+  const [editContent, setEditContent] = useState(contentStr);
   const [filesExpanded, setFilesExpanded] = useState(false);
+
+  useEffect(() => {
+    if (!isEditing) {
+      setEditContent(contentStr);
+    }
+  }, [contentStr, message.id, isEditing]);
 
   const handleCopy = async () => {
     try {
-      await navigator.clipboard.writeText(message.content);
+      await navigator.clipboard.writeText(contentStr);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch (err) {
@@ -303,7 +374,7 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
   };
 
   const handleEdit = () => {
-    setEditContent(message.content);
+    setEditContent(contentStr);
     setIsEditing(true);
   };
 
@@ -315,12 +386,12 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
   };
 
   const handleCancelEdit = () => {
-    setEditContent(message.content);
+    setEditContent(contentStr);
     setIsEditing(false);
   };
 
-  const isHtmlContent = message.content.startsWith('```html') && message.content.endsWith('```');
-  const isJsonContent = message.content.startsWith('```json') && message.content.endsWith('```');
+  const isHtmlContent = contentStr.startsWith('```html') && contentStr.endsWith('```');
+  const isJsonContent = contentStr.startsWith('```json') && contentStr.endsWith('```');
 
   const extractContent = (content: string, type: 'html' | 'json') => {
     const marker = `\`\`\`${type}`;
@@ -331,7 +402,7 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
 
   const renderContent = () => {
     if (isHtmlContent) {
-      const html = extractContent(message.content, 'html');
+      const html = extractContent(contentStr, 'html');
       return (
         <div style={{ padding: '12px 0' }}>
           <HtmlRenderer html={html} />
@@ -340,7 +411,7 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
     }
 
     if (isJsonContent) {
-      const json = extractContent(message.content, 'json');
+      const json = extractContent(contentStr, 'json');
       return (
         <div style={{ padding: '12px 0' }}>
           <JsonRenderer json={json} />
@@ -352,25 +423,29 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
       const inferenceResults = message.metadata.inferenceResults as InferenceResult[];
       return (
         <>
-          {message.content && (
+          {contentStr && (
             <MessageContent $isBot={isBot} $isThinking={message.isThinking}>
-              <MarkdownRenderer content={message.content} theme={theme} />
+              <DeckMarkdownRenderer content={contentStr} theme={theme} />
             </MessageContent>
           )}
           <InferenceResultsContainer>
             {inferenceResults.map((result, index) => (
-              <InferenceResultRenderer key={index} result={result} />
+              <InferenceResultRenderer key={index} result={result} theme={theme} />
             ))}
           </InferenceResultsContainer>
         </>
       );
-    } else {
-      return (
-        <MessageContent $isBot={isBot} $isThinking={message.isThinking}>
-          <MarkdownRenderer content={message.content} theme={theme} />
-        </MessageContent>
-      );
     }
+
+    if (!isBot) {
+      return <CollapsibleUserMessageBody content={contentStr} isThinking={message.isThinking} />;
+    }
+
+    return (
+      <MessageContent $isBot={isBot} $isThinking={message.isThinking}>
+        <DeckMarkdownRenderer content={contentStr} theme={theme} isLive={message.isThinking} />
+      </MessageContent>
+    );
   };
 
   const renderStatusBadge = () => {
@@ -466,7 +541,13 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
       window.localStorage?.getItem('yueli_debug_execution_log') === '1';
     
     const hasToolCalls = message.toolCallRecords && message.toolCallRecords.length > 0;
-    const hasThinking = message.thinkingRecords && message.thinkingRecords.length > 0;
+    const records = Array.isArray(message.thinkingRecords) ? message.thinkingRecords : [];
+    /** 执行日志只展示末尾快照（流式 reducer 每条 delta 都可能追加一笔，同源内容会叠叠乐） */
+    const latestThinkingText = records.length > 0 ? (records[records.length - 1]?.content ?? '') : '';
+    const hasThinking =
+      typeof latestThinkingText === 'string' && latestThinkingText.trim().length > 0;
+    const reasoningTrimmed = typeof message.reasoningContent === 'string' ? message.reasoningContent.trim() : '';
+    const hasReasoning = reasoningTrimmed.length > 0;
     const hasSkills = message.skillsUsed && message.skillsUsed.length > 0;
     const hasFinalStatus = message.finalStatus;
     const hasTimeline =
@@ -475,15 +556,16 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
       message.metrics &&
         (typeof message.metrics.providerHttpRounds === 'number' ||
           typeof message.metrics.totalLatencyMs === 'number' ||
-          typeof message.metrics.promptTokens === 'number' ||
-          typeof message.metrics.completionTokens === 'number' ||
-          typeof message.metrics.totalTokens === 'number')
+          (typeof message.metrics.promptTokens === 'number' && message.metrics.promptTokens > 0) ||
+          (typeof message.metrics.completionTokens === 'number' && message.metrics.completionTokens > 0) ||
+          (typeof message.metrics.totalTokens === 'number' && message.metrics.totalTokens > 0) ||
+          message.metrics.routeTrace)
     );
     const hasPermissionAudit =
       Array.isArray(message.permissionAuditTrail) && message.permissionAuditTrail.length > 0;
 
     if (debugExecutionLog) {
-      console.debug('📋 消息执行日志数据:', {
+      devDebug('📋 消息执行日志数据:', {
         toolCallRecordsCount: message.toolCallRecords?.length ?? 0,
         thinkingRecordsCount: message.thinkingRecords?.length ?? 0,
         skillsUsed: message.skillsUsed,
@@ -499,9 +581,10 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
     }
 
     // 如果没有任何可显示的内容，返回null
-    if (
+      if (
       !hasToolCalls &&
       !hasThinking &&
+      !hasReasoning &&
       !hasSkills &&
       !hasFinalStatus &&
       !hasTimeline &&
@@ -524,16 +607,26 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
           </ExecutionLogItem>
         )}
         
-        {/* 思考记录 */}
-        {hasThinking && message.thinkingRecords!.map((record, index) => (
-          <ExecutionLogItem key={`thinking-${index}`}>
+        {/* 思考记录（单行窗口 + 末尾快照） */}
+        {hasThinking && (
+          <ExecutionLogItem key="thinking-latest">
             <LogIcon>💭</LogIcon>
             <LogContent>
               <LogTitle>思考过程</LogTitle>
-              <LogDetails>{record.content}</LogDetails>
+              <ThinkingPinnedScroll text={latestThinkingText} />
             </LogContent>
           </ExecutionLogItem>
-        ))}
+        )}
+        {/* 上游 reasoning 字段（与 thinking 分列，同高度策略） */}
+        {hasReasoning && (
+          <ExecutionLogItem key="reasoning-content">
+            <LogIcon>🧠</LogIcon>
+            <LogContent>
+              <LogTitle>推理过程</LogTitle>
+              <ThinkingPinnedScroll text={reasoningTrimmed} />
+            </LogContent>
+          </ExecutionLogItem>
+        )}
         
         {/* 工具调用记录（卡片化，支持状态/耗时/结果折叠） */}
         {hasToolCalls && message.toolCallRecords!.map((record, index) => {
@@ -597,9 +690,9 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
                     parts.push(`总耗时 ${Math.round(m.totalLatencyMs)} ms`);
                   }
                   if (
-                    typeof m.promptTokens === 'number' ||
-                    typeof m.completionTokens === 'number' ||
-                    typeof m.totalTokens === 'number'
+                    (typeof m.promptTokens === 'number' && m.promptTokens > 0) ||
+                    (typeof m.completionTokens === 'number' && m.completionTokens > 0) ||
+                    (typeof m.totalTokens === 'number' && m.totalTokens > 0)
                   ) {
                     let tok = 'Tokens';
                     if (typeof m.promptTokens === 'number') tok += ` 提示 ${m.promptTokens}`;
@@ -607,6 +700,15 @@ const ChatMessageRenderer: React.FC<ChatMessageRendererProps> = ({
                     if (typeof m.totalTokens === 'number') tok += ` 合计 ${m.totalTokens}`;
                     tok += '（多轮工具时为各次 completion 累加）';
                     parts.push(tok);
+                  }
+                  const rt = m.routeTrace;
+                  if (rt?.tier) {
+                    let route = `${rt.tier}`;
+                    if (rt.vendor) route += ` · ${rt.vendor}`;
+                    if (rt.displayModel) route += ` / ${rt.displayModel}`;
+                    if (rt.l2ProviderPath) route += ` (${rt.l2ProviderPath})`;
+                    if (rt.transportFallback) route += ` · 回退: ${rt.transportFallback}`;
+                    parts.push(`路由 ${route}`);
                   }
                   return parts.join(' · ');
                 })()}

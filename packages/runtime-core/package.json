@@ -1,0 +1,15 @@
+{
+  "name": "@yuelicopilot/runtime-core",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Shared process orchestration for server (start.sh) and desktop profiles",
+  "bin": {
+    "yueli-up": "./bin/yueli-up.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./paths": "./src/paths.mjs",
+    "./ports": "./src/ports.mjs"
+  }
+}

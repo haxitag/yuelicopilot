@@ -1,4 +1,5 @@
 import { ErrorLevel, RetryPolicy } from '../../types';
+import { devWarn } from '../../utils/devConsole';
 
 export enum ErrorCategory {
   NETWORK = 'network',
@@ -180,7 +181,7 @@ export class ErrorHandler {
     try {
       return await operation();
     } catch (error) {
-      console.warn(`Operation failed, attempting fallback:`, error);
+      devWarn(`Operation failed, attempting fallback:`, error);
       return await fallback(error instanceof Error ? error : new Error(String(error)), context);
     }
   }
@@ -194,7 +195,7 @@ export class ErrorHandler {
       const result = await this.withCircuitBreaker(operation, context?.operation || 'default', context);
       return { result, degraded: false };
     } catch (error) {
-      console.warn(`Operation failed with circuit breaker, attempting degradation:`, error);
+      devWarn(`Operation failed with circuit breaker, attempting degradation:`, error);
       
       try {
         const degradedResult = await fallback(

@@ -1,23 +1,20 @@
-import { defineConfig } from 'vite'
+import { defineConfig, loadEnv } from 'vite'
 import react from '@vitejs/plugin-react'
-import http from 'node:http'
+import { buildViteProxyConfig } from './packages/gateway/src/proxyRoutes.mjs'
+import { normalizeListenPort } from './packages/gateway/src/upstreamPorts.mjs'
 
-const FRONTEND_PORT = parseInt(process.env.FRONTEND_PORT || '3002');
-const _skillExecutorPort = parseInt(process.env.SKILL_EXECUTOR_PORT || '3010', 10);
-const SKILL_EXECUTOR_PORT =
-  Number.isFinite(_skillExecutorPort) && _skillExecutorPort > 0 && _skillExecutorPort < 65536
-    ? _skillExecutorPort
-    : 3010;
-const KGM_PORT = parseInt(process.env.KGM_PORT || '3080', 10);
+const FRONTEND_PORT = normalizeListenPort(process.env.FRONTEND_PORT, 3002);
+const SKILL_EXECUTOR_PORT = normalizeListenPort(process.env.SKILL_EXECUTOR_PORT, 3010);
+const KGM_PORT = normalizeListenPort(process.env.KGM_PORT, 3080);
 
 function healthCheckPlugin() {
   return {
     name: 'health-check',
     configureServer(server) {
-      server.middlewares.use('/health', (req, res) => {
+      server.middlewares.use('/health', (_req, res) => {
         const health = {
           status: 'ok',
-          service: 'yueli-frontend',
+          service: 'yueli-frontend-dev',
           version: '1.0.0',
           timestamp: new Date().toISOString(),
           uptime: process.uptime(),
@@ -33,34 +30,23 @@ function healthCheckPlugin() {
   };
 }
 
-export default defineConfig({
-  plugins: [react(), healthCheckPlugin()],
-  server: {
-    port: FRONTEND_PORT,
-    proxy: {
-      '/api': {
-        target: `http://localhost:${SKILL_EXECUTOR_PORT}`,
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, '')
-      },
-      '/proxy': {
-        target: `http://localhost:${SKILL_EXECUTOR_PORT}`,
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/proxy/, ''),
-        configure: (proxy) => {
-          proxy.on('proxyReq', (proxyReq, req, res) => {
-            const url = req.url?.substring(7);
-            if (url) {
-              proxyReq.setHeader('X-Proxy-Target', url);
-            }
-          });
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), '');
+  const isDesktopMode = mode === 'desktop' || env.VITE_DEPLOY_PROFILE === 'desktop';
+
+  return {
+    plugins: [react(), healthCheckPlugin()],
+    optimizeDeps: {
+      include: ['@haxitag/markdown-gfm-normalize', 'pdfjs-dist']
+    },
+    define: isDesktopMode
+      ? {
+          'import.meta.env.VITE_DEPLOY_PROFILE': JSON.stringify('desktop'),
         }
-      },
-      '/kgm': {
-        target: `http://127.0.0.1:${KGM_PORT}`,
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/kgm/, '')
-      }
-    }
-  }
-})
+      : undefined,
+    server: {
+      port: FRONTEND_PORT,
+      proxy: buildViteProxyConfig({ kgmPort: KGM_PORT, executorPort: SKILL_EXECUTOR_PORT }),
+    },
+  };
+});

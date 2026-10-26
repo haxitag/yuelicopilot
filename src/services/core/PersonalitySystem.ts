@@ -9,6 +9,7 @@
  */
 
 import { promptRegistry } from '../PromptRegistry';
+import { devLog } from '../../utils/devConsole';
 
 // 使用localStorage作为浏览器环境的存储
 const STORAGE_KEY = 'yueli_personality_system_v1';
@@ -197,7 +198,7 @@ class PersonalitySystem {
         lastSynced: new Date().toISOString()
       };
       this.saveStore();
-      console.log(`[PersonalitySystem] 人格 '${personaId}' 已从PromptRegistry更新`);
+      devLog(`[PersonalitySystem] 人格 '${personaId}' 已从PromptRegistry更新`);
     }
   }
 

@@ -1,5 +1,7 @@
 import { ApiProvider } from '../../api/services/apiService';
+import { coerceKgmStreamTextChunk } from '../chat/kgmAssistantContent';
 import { debugManager } from '../DebugManager';
+import { devLog, devWarn } from '../../utils/devConsole';
 
 export type ResponseProvider = ApiProvider | 'internal' | 'unknown';
 
@@ -77,8 +79,12 @@ export class ResponseTransformer {
           }
         };
 
-        if (delta.content) {
-          result.content = delta.content;
+        if (delta.content != null && delta.content !== '') {
+          result.content = coerceKgmStreamTextChunk(delta.content);
+        }
+        // Ollama /api/generate 兼容：部分路由把 token 放在 response 而非 content
+        if (!result.content && delta.response != null && delta.response !== '') {
+          result.content = coerceKgmStreamTextChunk(delta.response);
         }
 
         if (delta.thinking || data.thinking) {
@@ -170,8 +176,8 @@ export class ResponseTransformer {
           }
         };
 
-        if (msg.content) {
-          result.content = msg.content;
+        if (msg.content != null && msg.content !== '') {
+          result.content = coerceKgmStreamTextChunk(msg.content);
         }
 
         if (msg.thinking) {
@@ -203,10 +209,16 @@ export class ResponseTransformer {
     // ApiService 在 provider=ollama 时使用 /api/generate；缺少本规则会落入默认分支把整段 JSON 当正文。
     this.addRule({
       name: 'ollama-generate-stream',
-      condition: (data) => typeof data?.response === 'string' && !data?.choices,
+      condition: (data) =>
+        !data?.choices &&
+        (typeof data?.response === 'string' ||
+          typeof data?.thinking === 'string' ||
+          typeof data?.reasoning === 'string'),
       transform: (data, context) => ({
         type: 'content' as const,
-        content: data.response,
+        content: typeof data.response === 'string' ? data.response : '',
+        thinking: typeof data.thinking === 'string' ? data.thinking : undefined,
+        reasoning: typeof data.reasoning === 'string' ? data.reasoning : undefined,
         metadata: {
           provider: context?.provider || 'ollama',
           model: data.model || context?.model,
@@ -289,13 +301,31 @@ export class ResponseTransformer {
       })
     });
 
+    // 6b. Yueli AI freemodel 等非 OpenAI 包装：{ success, data: { content } }
+    this.addRule({
+      name: 'yueliai-envelope',
+      condition: (data) =>
+        data?.success === true &&
+        data?.data != null &&
+        typeof data.data.content === 'string',
+      transform: (data, context) => ({
+        type: 'content' as const,
+        content: coerceKgmStreamTextChunk(data.data.content),
+        metadata: {
+          provider: context?.provider || 'kgm',
+          model: data.data.model || context?.model,
+          timestamp: Date.now()
+        }
+      })
+    });
+
     // 7. 纯文本内容响应
     this.addRule({
       name: 'plain-content',
       condition: (data) => typeof data === 'string' || (data.content && !data.choices && !data.message),
       transform: (data, context) => ({
         type: 'content',
-        content: typeof data === 'string' ? data : data.content,
+        content: typeof data === 'string' ? data : coerceKgmStreamTextChunk(data.content),
         metadata: {
           provider: context?.provider || 'unknown',
           timestamp: Date.now()
@@ -351,7 +381,7 @@ export class ResponseTransformer {
     try {
       return JSON.parse(str);
     } catch (e) {
-      console.warn('[ResponseTransformer] JSON parse error:', e);
+      devWarn('[ResponseTransformer] JSON parse error:', e);
       return fallback;
     }
   }
@@ -370,9 +400,7 @@ export class ResponseTransformer {
     // 找到第一个匹配的规则并应用
     for (const rule of this.rules) {
       if (rule.condition(rawData)) {
-        if (import.meta.env.DEV) {
-          console.log(`🔄 应用转换规则: ${rule.name}`);
-        }
+        devLog(`🔄 应用转换规则: ${rule.name}`);
         const partial = rule.transform(rawData, context);
         const result = this.completeResponse(partial, context);
         
@@ -387,9 +415,7 @@ export class ResponseTransformer {
     }
 
     // 默认处理：返回原始数据作为内容
-    if (import.meta.env.DEV) {
-      console.log('🔄 使用默认转换规则');
-    }
+    devLog('🔄 使用默认转换规则');
     const result = this.completeResponse({
       type: 'content',
       content: typeof rawData === 'string' ? rawData : JSON.stringify(rawData),

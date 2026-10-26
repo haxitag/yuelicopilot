@@ -4,6 +4,10 @@
  */
 
 import { MCPTool, MCPToolCall, MCPToolResult } from '../MCPRuntime';
+import {
+  resolveSkillExecutorAuthHeaders,
+  resolveSkillExecutorBaseUrl
+} from '../../../utils/skillExecutorUrl';
 
 export interface WebSearchInput {
   query: string;
@@ -118,42 +122,52 @@ class WebSearchToolImpl implements MCPTool {
   }
 
   private async performSearch(input: WebSearchInput): Promise<Array<{ title: string; url: string }>> {
-    // 未配置API Key时，明确返回错误而非假数据
-    if (!this.apiKey) {
-      return [{
-        title: '【提示】Web Search API 未配置',
-        url: 'https://www.google.com/search?q=' + encodeURIComponent(input.query)
-      }];
-    }
-
+    const executorBase = resolveSkillExecutorBaseUrl().replace(/\/$/, '');
     try {
-      const params = new URLSearchParams({
-        q: input.query,
-        ...(input.allowed_domains?.length && { engines: input.allowed_domains.join(',') }),
-        ...(input.blocked_domains?.length && { exclude: input.blocked_domains.join(',') }),
-        num: '10'
-      });
-
-      const response = await fetch(`${this.searchEndpoint}?${params}`, {
+      const res = await fetch(`${executorBase}/v1/tools/web_search`, {
+        method: 'POST',
         headers: {
-          'Authorization': `Bearer ${this.apiKey}`,
-          'Content-Type': 'application/json'
-        }
+          'Content-Type': 'application/json',
+          ...resolveSkillExecutorAuthHeaders()
+        },
+        body: JSON.stringify({
+          query: input.query,
+          allowed_domains: input.allowed_domains,
+          blocked_domains: input.blocked_domains
+        }),
+        signal: AbortSignal.timeout(25_000)
       });
-
-      if (!response.ok) {
-        throw new Error(`Search API error: ${response.status}`);
+      if (res.ok) {
+        const data = await res.json();
+        const parsed = this.parseResults(data?.results ?? data);
+        if (parsed.length > 0) return parsed;
       }
-
-      const data = await response.json();
-      return this.parseResults(data);
-    } catch (error) {
-      // API调用失败时返回提示信息，而非假数据
-      return [{
-        title: `【提示】搜索失败: ${error instanceof Error ? error.message : 'Unknown error'}`,
-        url: 'https://www.google.com/search?q=' + encodeURIComponent(input.query)
-      }];
+    } catch {
+      /* fall through to legacy endpoint */
     }
+
+    if (!this.apiKey?.trim()) {
+      throw new Error(
+        '联网搜索需 Skill Executor 可用，或在配置中填写搜索 API Key。请勾选「实时网络研究」技能。'
+      );
+    }
+
+    const params = new URLSearchParams({
+      q: input.query,
+      num: '10'
+    });
+    const response = await fetch(`${this.searchEndpoint}?${params}`, {
+      headers: {
+        Authorization: `Bearer ${this.apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      signal: AbortSignal.timeout(20_000)
+    });
+    if (!response.ok) {
+      throw new Error(`Search API error: ${response.status}`);
+    }
+    const data = await response.json();
+    return this.parseResults(data);
   }
 
   private parseResults(data: any): Array<{ title: string; url: string }> {

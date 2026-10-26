@@ -11,7 +11,16 @@ export default function ReloadRequiredBanner() {
   const count = reloadRequired.reasons.length;
 
   return (
-    <div style={{ position: 'fixed', left: 16, right: 16, bottom: 16, zIndex: 2000 }}>
+    <div
+      style={{
+        position: 'fixed',
+        left: '50%',
+        bottom: 18,
+        transform: 'translateX(-50%)',
+        width: 'min(560px, calc(100vw - 36px))',
+        zIndex: 2000
+      }}
+    >
       <Alert
         type="warning"
         showIcon

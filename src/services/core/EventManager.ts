@@ -18,6 +18,7 @@ import {
   ResourceInfo,
   ReplaySession
 } from '../../types';
+import { devLog } from '../../utils/devConsole';
 
 /**
  * 事件管理器 - 负责插件事件的分发与处理
@@ -313,7 +314,7 @@ export class AuditSystem {
    */
   private async replayRecord(record: AuditRecord): Promise<void> {
     this.eventManager.emit('replay:record', record);
-    console.log(`Replaying audit record: ${record.id}`, record);
+    devLog(`Replaying audit record: ${record.id}`, record);
   }
 
   /**
@@ -664,6 +665,14 @@ export class RepositoryParser {
         owner: match[1],
         id: match[2],
         url
+      };
+    }
+
+    // 直接 .skillpkg / .tar.gz 归档 URL
+    if (/\.(skillpkg|tar\.gz|tgz)(\?.*)?$/i.test(url.trim())) {
+      return {
+        type: 'skillpkg',
+        url: url.trim()
       };
     }
 

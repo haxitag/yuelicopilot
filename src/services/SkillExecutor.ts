@@ -27,6 +27,14 @@ import {
   resolveSkillExecutorAuthHeaders,
   resolveSkillExecutorBaseUrl
 } from '../utils/skillExecutorUrl';
+import { devLog, devWarn, devError } from '../utils/devConsole';
+import { parseSkillOutput, formatParsedSkillOutput } from './core/ResultParser';
+import {
+  buildEvolutionPayloadFromSkillRun,
+  postSkillEvolutionFeedback
+} from './core/skillEvolutionMetrics';
+import { fetchAbAssignment } from './core/skillEvolutionAb';
+import { isSkillEvolutionEnabled } from './chat/skillEvolutionPrefs';
 
 export interface SkillToolDefinition {
   type: 'function';
@@ -44,6 +52,8 @@ export interface SkillToolDefinition {
 export interface SkillExecutionResult {
   success: boolean;
   result?: string;
+  /** output_schema / skill_output 结构化校验是否通过 */
+  result_valid?: boolean;
   toolCalls?: Array<{ name: string; args: any; result: string }>;
   error?: string;
   sandboxMetrics?: any;
@@ -85,7 +95,7 @@ export class SkillExecutor {
   private listenPromptRegistryUpdates(): void {
     promptRegistry.on('prompt:updated', (event: { id: string }) => {
       if (event.id.startsWith('skill-')) {
-        console.log(`[SkillExecutor] Skill prompt '${event.id}' updated from PromptRegistry, will take effect on next use`);
+        devLog(`[SkillExecutor] Skill prompt '${event.id}' updated from PromptRegistry, will take effect on next use`);
       }
     });
   }
@@ -126,7 +136,7 @@ export class SkillExecutor {
 
       await SkillExecutor.syncSkillRegistryRemote(packages);
     } catch (e) {
-      console.warn('[SkillExecutor] hydrateSkillsFromLocalScan:', e);
+      devWarn('[SkillExecutor] hydrateSkillsFromLocalScan:', e);
     }
   }
 
@@ -197,7 +207,7 @@ export class SkillExecutor {
     const retry = normalizeSkillManifest(migrateLegacyManifest(raw));
     if (retry.ok) return retry.manifest;
 
-    console.warn('[SkillExecutor] scanRowToManifest failed:', id, !normalized.ok ? normalized.errors : []);
+    devWarn('[SkillExecutor] scanRowToManifest failed:', id, !normalized.ok ? normalized.errors : []);
     return null;
   }
 
@@ -254,7 +264,7 @@ export class SkillExecutor {
         }
       });
     } catch (error) {
-      console.error('从本地存储加载技能失败:', error);
+      devError('从本地存储加载技能失败:', error);
     }
   }
 
@@ -263,7 +273,7 @@ export class SkillExecutor {
       const skills = Array.from(this.skills.values());
       localStorage.setItem(this.STORAGE_KEY, JSON.stringify(skills));
     } catch (error) {
-      console.error('保存技能到本地存储失败:', error);
+      devError('保存技能到本地存储失败:', error);
     }
   }
 
@@ -808,6 +818,354 @@ export class SkillExecutor {
       source: 'local'
     });
 
+    // 实时网络研究：DuckDuckGo + Jina Reader（r.jina.ai）
+    const webResearchConfig: SkillConfig = {
+      name: '实时网络研究',
+      description:
+        '联网搜索并深读网页：DuckDuckGo 检索 + Jina Reader 将 URL 转为 Markdown 上下文，用于回答需要最新公开信息的问题',
+      systemPrompt: [
+        '你是实时网络研究助手。当用户问题依赖最新公开网页信息时：',
+        '1. 优先调用 web_research（一次完成搜索+深读）；或先 web_search 再对关键 URL 调用 web_read。',
+        '2. web_read 走 Jina Reader (r.jina.ai)，比裸 HTML 抓取更适合 LLM。',
+        '3. 只根据工具返回的正文回答；找不到时明确说明，不要编造。',
+        '4. 勿请求内网/localhost 等私有 URL。'
+      ].join('\n'),
+      tools: [
+        {
+          name: 'web_search',
+          description: 'DuckDuckGo 联网搜索，返回标题/链接/摘要列表',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: '搜索关键词' },
+              allowed_domains: {
+                type: 'array',
+                items: { type: 'string' },
+                description: '仅保留这些域名（可选）'
+              },
+              blocked_domains: {
+                type: 'array',
+                items: { type: 'string' },
+                description: '排除这些域名（可选）'
+              }
+            },
+            required: ['query']
+          },
+          handler: async (params: any) => {
+            return await SkillExecutor.callSkillTool('web_search', params);
+          }
+        },
+        {
+          name: 'web_read',
+          description:
+            '通过 Jina Reader (https://r.jina.ai/{url}) 读取网页 Markdown 正文，供 LLM 分析',
+          parameters: {
+            type: 'object',
+            properties: {
+              url: { type: 'string', description: '要读取的公开 HTTP(S) URL' },
+              max_length: { type: 'number', description: '最大字符数', default: 12000 }
+            },
+            required: ['url']
+          },
+          handler: async (params: any) => {
+            return await SkillExecutor.callSkillTool('web_read', {
+              url: params.url,
+              max_length: params.max_length ?? 12000
+            });
+          }
+        },
+        {
+          name: 'web_research',
+          description:
+            '组合工具：搜索 query 后自动用 Jina Reader 深读 Top 3 结果，返回可注入 LLM 的上下文（推荐）',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string', description: '研究主题或搜索词' },
+              top_urls: {
+                type: 'number',
+                description: '深读搜索结果条数（1-5）',
+                default: 3
+              },
+              max_length_per_url: {
+                type: 'number',
+                description: '每个 URL 最大正文字符',
+                default: 12000
+              },
+              allowed_domains: { type: 'array', items: { type: 'string' } },
+              blocked_domains: { type: 'array', items: { type: 'string' } }
+            },
+            required: ['query']
+          },
+          handler: async (params: any) => {
+            return await SkillExecutor.callSkillTool('web_research', {
+              ...params,
+              format: 'markdown'
+            });
+          }
+        },
+        {
+          name: 'web_fetch',
+          description: '直连抓取网页（HTML 清洗）；Jina 失败时可作兜底',
+          parameters: {
+            type: 'object',
+            properties: {
+              url: { type: 'string', description: '网页 URL' },
+              max_length: { type: 'number', default: 50000 },
+              reader: {
+                type: 'string',
+                enum: ['auto', 'jina', 'direct'],
+                description: 'auto=先直连失败再 Jina'
+              }
+            },
+            required: ['url']
+          },
+          handler: async (params: any) => {
+            const reader =
+              params.reader === 'jina'
+                ? 'jina'
+                : params.reader === 'direct'
+                  ? 'direct'
+                  : 'auto';
+            return await SkillExecutor.callSkillTool('web_fetch', {
+              url: params.url,
+              max_length: params.max_length ?? 50000,
+              reader
+            });
+          }
+        }
+      ]
+    };
+    this.skillConfigs.set('realtime-web-research', webResearchConfig);
+
+    this.registerSkill({
+      id: 'realtime-web-research',
+      name: '实时网络研究',
+      description: 'DuckDuckGo 搜索 + Jina Reader 深读，动态召回实时网络内容',
+      version: '1.0.0',
+      author: 'System',
+      installed: true,
+      category: 'research',
+      tags: ['搜索', '联网', 'Jina', '网页', '实时'],
+      structure: { skimmable: true, files: [] },
+      permissions: ['network.http'],
+      source: 'local'
+    });
+
+    const desktopKnowledgeConfig: SkillConfig = {
+      name: '桌面知识 Agent',
+      description:
+        '本机工作区索引、多源融合召回、项目记忆、剪贴板入库、定时情报与带脚注报告（P0–P2）',
+      systemPrompt:
+        '你是桌面知识助理。优先引用 [L#] 工作区、[D#] 文档、[M#] 记忆、[W#] 网页脚注；本地-only 模式下禁止编造外网来源。',
+      tools: [
+        {
+          name: 'fusion_recall',
+          description: '多源融合召回：工作区 > 会话附件 > 主题记忆 > 可选联网',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type: 'string' },
+              policy: {
+                type: 'string',
+                enum: [
+                  'local_first',
+                  'session_first',
+                  'memory_first',
+                  'web_supplement',
+                  'local_only'
+                ]
+              },
+              session_id: { type: 'string' },
+              topic_id: { type: 'string' },
+              workspace_id: { type: 'string' },
+              document_ids: { type: 'array', items: { type: 'string' } },
+              include_web: { type: 'boolean', default: false },
+              top_k: { type: 'number', default: 8 }
+            },
+            required: ['query']
+          },
+          handler: async (params: any) =>
+            SkillExecutor.callSkillTool('fusion_recall', {
+              query: params.query,
+              policy: params.policy,
+              sessionId: params.session_id,
+              topicId: params.topic_id,
+              workspaceId: params.workspace_id,
+              documentIds: params.document_ids,
+              includeWeb: params.include_web,
+              topK: params.top_k
+            })
+        },
+        {
+          name: 'workspace_scan',
+          description: '扫描本机授权目录并增量入库（workspace session）',
+          parameters: {
+            type: 'object',
+            properties: {
+              workspace_id: { type: 'string' },
+              root_path: { type: 'string' },
+              max_files: { type: 'number', default: 50 }
+            },
+            required: ['workspace_id', 'root_path']
+          },
+          handler: async (params: any) =>
+            SkillExecutor.callSkillTool('workspace_scan', {
+              workspace_id: params.workspace_id,
+              root_path: params.root_path,
+              max_files: params.max_files
+            })
+        },
+        {
+          name: 'desktop_image_ocr',
+          description: 'PaddleOCR 识别图片/截图文字（AI Studio，不入库）',
+          parameters: {
+            type: 'object',
+            properties: {
+              file_path: { type: 'string', description: 'Executor 本机图片路径' },
+              file_url: { type: 'string', description: '公网图片 URL' },
+              image_base64: { type: 'string', description: 'Base64 图片（可含 data: 前缀）' },
+              file_name: { type: 'string', default: 'screenshot.png' }
+            }
+          },
+          handler: async (params: any) =>
+            SkillExecutor.callSkillTool('desktop_image_ocr', {
+              file_path: params.file_path,
+              file_url: params.file_url,
+              image_base64: params.image_base64,
+              file_name: params.file_name
+            })
+        },
+        {
+          name: 'desktop_image_ocr_ingest',
+          description: 'PaddleOCR 识别截图/图片并写入当前会话 RAG（P1）',
+          parameters: {
+            type: 'object',
+            properties: {
+              session_id: { type: 'string' },
+              file_path: { type: 'string' },
+              file_url: { type: 'string' },
+              image_base64: { type: 'string' },
+              file_name: { type: 'string' },
+              title: { type: 'string' },
+              topic_id: { type: 'string' },
+              ingest: { type: 'boolean', default: true }
+            },
+            required: ['session_id']
+          },
+          handler: async (params: any) =>
+            SkillExecutor.callSkillTool('desktop_image_ocr_ingest', {
+              sessionId: params.session_id,
+              file_path: params.file_path,
+              file_url: params.file_url,
+              image_base64: params.image_base64,
+              file_name: params.file_name,
+              title: params.title,
+              topicId: params.topic_id,
+              ingest: params.ingest
+            })
+        },
+        {
+          name: 'desktop_clipboard_ingest',
+          description: '将剪贴板/摘录文本入库到当前会话 RAG',
+          parameters: {
+            type: 'object',
+            properties: {
+              session_id: { type: 'string' },
+              text: { type: 'string' },
+              title: { type: 'string' }
+            },
+            required: ['session_id', 'text']
+          },
+          handler: async (params: any) =>
+            SkillExecutor.callSkillTool('desktop_clipboard_ingest', {
+              sessionId: params.session_id,
+              text: params.text,
+              title: params.title
+            })
+        },
+        {
+          name: 'desktop_project_memory_add',
+          description: '写入绑定 topicId 的项目长期记忆',
+          parameters: {
+            type: 'object',
+            properties: {
+              topic_id: { type: 'string' },
+              title: { type: 'string' },
+              content: { type: 'string' },
+              user_id: { type: 'string' }
+            },
+            required: ['topic_id', 'content']
+          },
+          handler: async (params: any) =>
+            SkillExecutor.callSkillTool('desktop_project_memory_add', {
+              topicId: params.topic_id,
+              title: params.title,
+              content: params.content,
+              userId: params.user_id
+            })
+        },
+        {
+          name: 'desktop_research_plan',
+          description: '将研究主题拆分为子问题清单（P2）',
+          parameters: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+            required: ['query']
+          },
+          handler: async (params: any) =>
+            SkillExecutor.callSkillTool('desktop_research_plan', { query: params.query })
+        },
+        {
+          name: 'desktop_export_report',
+          description: '生成带引用脚注的调研报告 Markdown 骨架',
+          parameters: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              query: { type: 'string' },
+              llm_context: { type: 'string' },
+              web_context: { type: 'string' }
+            },
+            required: ['query']
+          },
+          handler: async (params: any) =>
+            SkillExecutor.callSkillTool('desktop_export_report', {
+              title: params.title,
+              query: params.query,
+              llmContext: params.llm_context,
+              webContext: params.web_context
+            })
+        },
+        {
+          name: 'desktop_digest_run',
+          description: '立即执行一次定时情报任务（需未开启 local-only）',
+          parameters: {
+            type: 'object',
+            properties: { job_id: { type: 'string' } },
+            required: ['job_id']
+          },
+          handler: async (params: any) =>
+            SkillExecutor.callSkillTool('desktop_digest_run', { job_id: params.job_id })
+        }
+      ]
+    };
+    this.skillConfigs.set('desktop-knowledge-agent', desktopKnowledgeConfig);
+
+    this.registerSkill({
+      id: 'desktop-knowledge-agent',
+      name: '桌面知识 Agent',
+      description: '本机工作区、融合召回、项目记忆、剪贴板、定时情报与报告导出',
+      version: '1.0.0',
+      author: 'System',
+      installed: true,
+      category: 'knowledge',
+      tags: ['桌面', '工作区', 'RAG', '记忆', '融合'],
+      structure: { skimmable: true, files: [] },
+      permissions: ['filesystem.read', 'network.http'],
+      source: 'local'
+    });
+
     // 上下文召回约束技能 - 从PromptRegistry获取systemPrompt
     const contextRecallConfig: SkillConfig = {
       name: '上下文召回约束',
@@ -940,7 +1298,7 @@ export class SkillExecutor {
       // 指数退避 + 抖动
       const delay = Math.min(baseDelayMs * Math.pow(2, attempt - 1), maxDelayMs);
       const jitter = delay * 0.2 * Math.random();
-      console.warn(`[SkillExecutor] 请求失败 (尝试 ${attempt}/${maxAttempts})，${delay + jitter}ms 后重试...`);
+      devWarn(`[SkillExecutor] 请求失败 (尝试 ${attempt}/${maxAttempts})，${delay + jitter}ms 后重试...`);
       await new Promise(resolve => setTimeout(resolve, delay + jitter));
       return this.fetchWithRetry(url, options, attempt + 1);
     }
@@ -1008,7 +1366,7 @@ export class SkillExecutor {
         { method: 'GET' }
       );
       if (!healthCheck.ok) {
-        console.warn(`[SkillExecutor] Skill Executor 服务不可用: ${executorUrl}/health 返回 ${healthCheck.status}`);
+        devWarn(`[SkillExecutor] Skill Executor 服务不可用: ${executorUrl}/health 返回 ${healthCheck.status}`);
         return { success: false, error: `Skill Executor 服务不可用 (${healthCheck.status})` };
       }
 
@@ -1031,14 +1389,14 @@ export class SkillExecutor {
 
       if (!response.ok) {
         const errorText = await response.text();
-        console.warn(`[SkillExecutor] Skill 执行失败: ${response.status} - ${errorText}`);
+        devWarn(`[SkillExecutor] Skill 执行失败: ${response.status} - ${errorText}`);
         return { success: false, error: `Skill 执行失败: ${response.status} - ${errorText}` };
       }
 
       return await response.json();
     } catch (e) {
       const errorMsg = e instanceof Error ? e.message : String(e);
-      console.warn(`[SkillExecutor] 无法连接到 Skill Executor (${executorUrl}): ${errorMsg}`);
+      devWarn(`[SkillExecutor] 无法连接到 Skill Executor (${executorUrl}): ${errorMsg}`);
       return { success: false, error: `无法连接到 Skill Executor: ${errorMsg}` };
     }
   }
@@ -1055,7 +1413,7 @@ export class SkillExecutor {
   registerSkillFromManifest(skillId: string, manifestInput: SkillManifest | Record<string, unknown>) {
     const normalized = normalizeSkillManifest(manifestInput);
     if (!normalized.ok) {
-      console.warn(
+      devWarn(
         `[SkillExecutor] registerSkillFromManifest: manifest invalid for ${skillId}`,
         normalized.errors
       );
@@ -1336,7 +1694,7 @@ export class SkillExecutor {
         throw error;
       }
       const elapsed = Date.now() - startTime;
-      console.error(`[SkillExecutor] Tool ${toolName} failed after ${elapsed}ms:`, error);
+      devError(`[SkillExecutor] Tool ${toolName} failed after ${elapsed}ms:`, error);
       // 返回错误信息而不是抛出，防止对话中断
       return `Error: ${error instanceof Error ? error.message : 'Tool execution failed'}`;
     }
@@ -1352,6 +1710,24 @@ export class SkillExecutor {
   ): Promise<SkillExecutionResult> {
     const startTime = Date.now();
     let result: SkillExecutionResult;
+
+    const userId =
+      (typeof context.variables?.userId === 'string' && context.variables.userId) || 'default';
+    if (isSkillEvolutionEnabled()) {
+      const ab = await fetchAbAssignment(skillId, userId);
+      if (ab.assigned && ab.systemPrompt?.trim()) {
+        context.variables = {
+          ...context.variables,
+          userId,
+          abVariant: ab.variant,
+          abSystemPrompt: ab.systemPrompt.trim()
+        };
+      } else {
+        context.variables = { ...context.variables, userId };
+      }
+    } else {
+      context.variables = { ...context.variables, userId };
+    }
 
     try {
       const skill = this.skills.get(skillId);
@@ -1371,7 +1747,7 @@ export class SkillExecutor {
       const deniedPermissions = permissionResults.filter(r => !r.allowed);
       if (deniedPermissions.length > 0) {
         result = { success: false, error: `权限不足: ${deniedPermissions.map(r => r.requested).join(', ')}`, permissions: permissionResults };
-        this.recordEvolutionFeedback(skillId, skill.name, result, startTime);
+        this.recordEvolutionFeedback(skillId, skill.name, result, startTime, context);
         return result;
       }
 
@@ -1395,9 +1771,19 @@ export class SkillExecutor {
       );
 
       if (sandboxResult.success) {
+        const rawOut =
+          typeof sandboxResult.output?.result === 'string'
+            ? sandboxResult.output.result
+            : sandboxResult.output?.result != null
+              ? JSON.stringify(sandboxResult.output.result)
+              : '';
+        const installed = await new SkillStorage().get(skillId).catch(() => null);
+        const manifest = installed?.manifest;
+        const parsed = parseSkillOutput(rawOut, manifest as SkillManifest | undefined);
         result = {
           success: true,
-          result: sandboxResult.output?.result,
+          result: formatParsedSkillOutput(parsed),
+          result_valid: parsed.result_valid,
           toolCalls: sandboxResult.output?.toolCalls,
           sandboxMetrics: sandboxResult.metrics,
           permissions: permissionResults
@@ -1416,7 +1802,7 @@ export class SkillExecutor {
 
     // 记录自进化反馈
     const skill = this.skills.get(skillId);
-    this.recordEvolutionFeedback(skillId, skill?.name || skillId, result, startTime);
+    this.recordEvolutionFeedback(skillId, skill?.name || skillId, result, startTime, context);
 
     // 记录会话记忆
     this.recordSessionMemory(skillId, skill?.name || skillId, result, context);
@@ -1466,7 +1852,7 @@ export class SkillExecutor {
         })
       });
     } catch (e) {
-      console.warn('[SkillExecutor] 无法记录用户偏好（服务可能未运行）:', e);
+      devWarn('[SkillExecutor] 无法记录用户偏好（服务可能未运行）:', e);
     }
   }
 
@@ -1477,31 +1863,27 @@ export class SkillExecutor {
     skillId: string,
     skillName: string,
     result: SkillExecutionResult,
-    startTime: number
+    startTime: number,
+    context?: SkillExecutionContext
   ): Promise<void> {
-    const durationMs = Date.now() - startTime;
-    const executorUrl = this.getExecutorUrl();
-    
-    // P1-2: 空 URL 检查，防止无效请求
-    if (!executorUrl) return;
-
-    try {
-      await fetch(`${executorUrl}/v1/evolution/feedback`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...resolveSkillExecutorAuthHeaders() },
-        body: JSON.stringify({
-          skillId,
-          skillName,
-          durationMs,
-          success: result.success,
-          error: result.error,
-          args: {},
-          resultSize: result.result?.length || 0
-        })
-      });
-    } catch (e) {
-      console.warn('[SkillExecutor] 无法记录技能进化反馈（服务可能未运行）:', e);
-    }
+    const config = this.skillConfigs.get(skillId);
+    const payload = buildEvolutionPayloadFromSkillRun({
+      skillId,
+      skillName,
+      startTimeMs: startTime,
+      success: result.success,
+      error: result.error,
+      resultText: result.result,
+      result_valid: result.result_valid,
+      toolCalls: result.toolCalls,
+      systemPrompt: config?.systemPrompt,
+      userInput: context?.userInput,
+      variables: context?.variables,
+      phase: 'skill_execute',
+      ab_variant:
+        typeof context?.variables?.abVariant === 'string' ? context.variables.abVariant : null
+    });
+    await postSkillEvolutionFeedback(payload);
   }
 
   /**
@@ -1540,10 +1922,10 @@ export class SkillExecutor {
       });
 
       if (!response.ok) {
-        console.warn(`[SkillExecutor] 记录会话记忆失败 (${response.status})`);
+        devWarn(`[SkillExecutor] 记录会话记忆失败 (${response.status})`);
       }
     } catch (e) {
-      console.warn('[SkillExecutor] 无法记录会话记忆（服务可能未运行）:', e);
+      devWarn('[SkillExecutor] 无法记录会话记忆（服务可能未运行）:', e);
     }
   }
 
@@ -1584,7 +1966,7 @@ export class SkillExecutor {
         return value;
       }, space);
     } catch (e) {
-      console.error('[SkillExecutor] safeStringify failed:', e);
+      devError('[SkillExecutor] safeStringify failed:', e);
       return String(obj);
     }
   }
@@ -1594,6 +1976,14 @@ export class SkillExecutor {
     context: SkillExecutionContext
   ): string {
     let prompt = config.systemPrompt;
+
+    const abPrompt =
+      typeof context.variables?.abSystemPrompt === 'string'
+        ? context.variables.abSystemPrompt.trim()
+        : '';
+    if (abPrompt) {
+      prompt += '\n\n## A/B 注入变体\n' + abPrompt;
+    }
 
     if (context.history.length > 0) {
       const recentHistory = context.history.slice(-3);
@@ -1607,7 +1997,11 @@ export class SkillExecutor {
     if (Object.keys(context.variables).length > 0) {
       prompt += '\n\n## 变量';
       Object.entries(context.variables).forEach(([key, value]) => {
-        prompt += `\n${key}: ${value}`;
+        const v =
+          value !== null && typeof value === 'object'
+            ? JSON.stringify(value, null, 2)
+            : String(value);
+        prompt += `\n${key}: ${v}`;
       });
     }
 

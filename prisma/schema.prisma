@@ -1,0 +1,39 @@
+// 聊天 PDF 文档模型（可选 Postgres + pgvector 扩展由 DBA 执行）
+// 运行时默认仍用 Executor SQLite；设置 CHAT_DOCUMENTS_DATABASE_URL 后走 server/lib/chatDocumentsPg.mjs
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("CHAT_DOCUMENTS_DATABASE_URL")
+}
+
+model ChatDocument {
+  id              String          @id
+  sessionId       String          @map("session_id")
+  fileName        String          @map("file_name")
+  charCount       Int             @default(0) @map("char_count")
+  chunkCount      Int             @default(0) @map("chunk_count")
+  indexed         Boolean         @default(false)
+  rawTextPreview  String?         @map("raw_text_preview")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  chunks          DocumentChunk[]
+
+  @@index([sessionId])
+  @@map("chat_documents")
+}
+
+model DocumentChunk {
+  id          String       @id
+  documentId  String       @map("document_id")
+  chunkIndex  Int          @map("chunk_index")
+  content     String
+  createdAt   DateTime     @default(now()) @map("created_at")
+  document    ChatDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([documentId])
+  @@map("document_chunks")
+}

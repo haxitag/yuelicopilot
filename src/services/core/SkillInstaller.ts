@@ -13,7 +13,21 @@ import {
   type SkillManifest,
   type InstalledSkillData
 } from './SkillManifestSchema';
+import { scanSkillCodeFiles, formatScanFailures } from './SkillCodeScanner';
+import { verifySkillPkgOptional, readTrustedSignerPubkeysB64FromStorage } from './skillPkgVerification';
+import {
+  fetchSkillPkgArchiveFromUrl,
+  isSkillPkgArchiveUrl
+} from './skillPkgArchive';
+import {
+  buildSkillLockfile,
+  serializeSkillLockfile,
+  skillLockfilesEqual,
+  SKILL_LOCKFILE_NAME
+} from './skillLockfile';
+import { checkRequiresSemver } from './skillRegistryResolve';
 import { resolveSkillExecutorAuthHeaders, resolveSkillExecutorBaseUrl } from '../../utils/skillExecutorUrl';
+import { devLog, devWarn } from '../../utils/devConsole';
 
 export type { SkillManifest, InstalledSkillData } from './SkillManifestSchema';
 
@@ -25,6 +39,8 @@ export interface DiscoveredSkill {
   author: string;
   repository?: RepositoryInfo;
   manifest?: any;
+  /** .skillpkg 拉取后预填，避免 pullSkillCode 二次请求 */
+  prefetchedFiles?: Record<string, string>;
 }
 
 export class SkillInstaller {
@@ -56,7 +72,34 @@ export class SkillInstaller {
     this.sandboxManager = SandboxManager.getInstance(auditSystem, eventManager);
   }
 
+  private async verifyRequiresSemver(manifest: SkillManifest) {
+    await this.skillStorage.open();
+    const installed = await this.skillStorage.getAll();
+    const byId: Record<string, { skillId: string; version: string; manifest: SkillManifest }> = {};
+    for (const row of installed) {
+      if (row.manifest?.id) {
+        byId[row.manifest.id] = {
+          skillId: row.manifest.id,
+          version: row.manifest.version,
+          manifest: row.manifest
+        };
+      }
+    }
+    return checkRequiresSemver(manifest, byId);
+  }
+
+  async getInstalledManifest(skillId: string): Promise<SkillManifest | null> {
+    await this.skillStorage.open();
+    const data = await this.skillStorage.get(skillId);
+    return data?.manifest ?? null;
+  }
+
   async discoverSkillsFromUrl(url: string): Promise<DiscoveredSkill[]> {
+    const trimmed = url.trim();
+    if (isSkillPkgArchiveUrl(trimmed)) {
+      return this.discoverFromSkillPkgUrl(trimmed);
+    }
+
     const repoInfo = this.repositoryParser.parseUrl(url);
     
     if (!repoInfo) {
@@ -108,7 +151,7 @@ export class SkillInstaller {
         if (found.length > 0) return found;
       }
     } catch (e) {
-      console.warn('本地技能扫描失败:', e);
+      devWarn('本地技能扫描失败:', e);
     }
 
     // 扫描失败时返回空数组，不返回假数据
@@ -571,14 +614,51 @@ export class SkillInstaller {
 
     if (skills.length === 0) {
       // 无法从 HTML 解析出技能，不返回假数据
-      console.warn(`无法从 ${repoInfo.url} 解析出技能信息`);
+      devWarn(`无法从 ${repoInfo.url} 解析出技能信息`);
     }
 
     return skills;
   }
 
+  private async discoverFromSkillPkgUrl(url: string): Promise<DiscoveredSkill[]> {
+    const files = await fetchSkillPkgArchiveFromUrl(url);
+    let rawManifest: unknown;
+    if (files['skill.json']) {
+      rawManifest = JSON.parse(files['skill.json']);
+    } else if (files['manifest.json']) {
+      rawManifest = JSON.parse(files['manifest.json']);
+    } else {
+      throw new Error('skillpkg 内缺少 skill.json 或 manifest.json');
+    }
+    const normalized = normalizeSkillManifest(rawManifest);
+    if (!normalized.ok) {
+      throw new Error(`skillpkg manifest 无效: ${normalized.errors.join('; ')}`);
+    }
+    const m = normalized.manifest;
+    return [
+      {
+        id: m.id,
+        name: m.name,
+        description: m.description,
+        version: m.version,
+        author: m.author,
+        repository: { type: 'skillpkg', url },
+        manifest: m,
+        prefetchedFiles: files
+      }
+    ];
+  }
+
   private async pullSkillCode(skill: DiscoveredSkill): Promise<Record<string, string>> {
+    if (skill.prefetchedFiles && Object.keys(skill.prefetchedFiles).length > 0) {
+      return { ...skill.prefetchedFiles };
+    }
+
     const files: Record<string, string> = {};
+
+    if (skill.repository?.type === 'skillpkg') {
+      return fetchSkillPkgArchiveFromUrl(skill.repository.url);
+    }
 
     if (skill.repository?.type === 'github') {
       try {
@@ -687,22 +767,22 @@ export class SkillInstaller {
       } else if (dep === 'ffmpeg') {
         installCommand = 'brew install ffmpeg';
       } else {
-        console.warn(`未知依赖: ${dep}，跳过自动安装`);
+        devWarn(`未知依赖: ${dep}，跳过自动安装`);
         return false;
       }
 
-      console.log(`正在安装依赖: ${dep}`);
+      devLog(`正在安装依赖: ${dep}`);
       const result = await this.executeCommand(installCommand);
       
       if (result.exitCode === 0) {
-        console.log(`依赖 ${dep} 安装成功`);
+        devLog(`依赖 ${dep} 安装成功`);
         return true;
       } else {
-        console.warn(`依赖 ${dep} 安装失败: ${result.stderr}`);
+        devWarn(`依赖 ${dep} 安装失败: ${result.stderr}`);
         return false;
       }
     } catch (error) {
-      console.warn(`安装依赖 ${dep} 时出错:`, error);
+      devWarn(`安装依赖 ${dep} 时出错:`, error);
       return false;
     }
   }
@@ -716,11 +796,11 @@ export class SkillInstaller {
       const blockedDeps = deps.filter(dep => !this.sandboxManager.isDependencyAllowed(dep));
       
       if (blockedDeps.length > 0) {
-        console.warn(`以下依赖不在白名单中，已阻止安装: ${blockedDeps.join(', ')}`);
+        devWarn(`以下依赖不在白名单中，已阻止安装: ${blockedDeps.join(', ')}`);
       }
       
       if (allowedDeps.length > 0) {
-        console.log(`为技能 ${skillId} 安装依赖到全局沙箱: ${allowedDeps.join(', ')}`);
+        devLog(`为技能 ${skillId} 安装依赖到全局沙箱: ${allowedDeps.join(', ')}`);
         
         // 确保全局沙箱存在并安装依赖
         try {
@@ -741,7 +821,7 @@ export class SkillInstaller {
             permissions: ['execute', 'file_read', 'network']
           });
           
-          console.log(`技能 ${skillId} 已注册到全局沙箱`);
+          devLog(`技能 ${skillId} 已注册到全局沙箱`);
         } catch (error) {
           console.error(`安装依赖或注册技能失败:`, error);
         }
@@ -757,6 +837,25 @@ export class SkillInstaller {
     try {
       // Step 1: 拉取技能代码
       const codeFiles = await this.pullSkillCode(skill);
+
+      const filesForIntegrity = { ...codeFiles };
+      delete filesForIntegrity[SKILL_LOCKFILE_NAME];
+
+      const trusted = readTrustedSignerPubkeysB64FromStorage();
+      const sigVerify = await verifySkillPkgOptional(
+        filesForIntegrity,
+        trusted ? { trustedSignerPubkeysB64: trusted } : undefined
+      );
+      if (!sigVerify.skipped && !sigVerify.ok) {
+        this.auditSystem.record(AuditType.INSTALL_SKILL_ERROR, skill.id, 'failed', {
+          error: 'skill_pkg_signature_failed',
+          metadata: {
+            reason: sigVerify.reason,
+            skillPkg: sigVerify.audit
+          }
+        });
+        throw new Error(`skillpkg 签名校验失败: ${sigVerify.reason ?? 'unknown'}`);
+      }
       
       // Step 1.5: 检查并自动安装依赖
       await this.checkAndInstallDependencies(skill.id, codeFiles);
@@ -781,11 +880,60 @@ export class SkillInstaller {
 
       const normalized = normalizeSkillManifest(rawManifest);
       if (!normalized.ok) {
+        this.auditSystem.record(AuditType.INSTALL_SKILL_ERROR, skill.id, 'failed', {
+          error: 'manifest_validation_failed',
+          metadata: { errors: normalized.errors }
+        });
         throw new Error(`skill manifest 校验失败: ${normalized.errors.join('; ')}`);
       }
       const manifest = normalized.manifest;
+      if (!manifest.systemPrompt?.trim() && codeFiles['SKILL.md']?.trim()) {
+        manifest.systemPrompt = codeFiles['SKILL.md'].trim();
+      }
 
+      const codeScan = await scanSkillCodeFiles(codeFiles, manifest);
+      if (!codeScan.ok) {
+        const detail = formatScanFailures(codeScan);
+        this.auditSystem.record(AuditType.INSTALL_SKILL_ERROR, skill.id, 'failed', {
+          error: 'capability_scan_failed',
+          metadata: { violations: codeScan.violations }
+        });
+        throw new Error(`技能代码能力与 manifest 申报不一致: ${detail}`);
+      }
+
+      const requiresSemver = await this.verifyRequiresSemver(manifest);
+      if (!requiresSemver.ok) {
+        const msg = requiresSemver.details
+          .filter((d) => !d.ok)
+          .map((d) => `${d.skillId}: ${d.reason ?? d.requestedRange}`)
+          .join('; ');
+        this.auditSystem.record(AuditType.INSTALL_SKILL_ERROR, skill.id, 'failed', {
+          error: 'requires_semver_unsatisfied',
+          metadata: { details: requiresSemver.details }
+        });
+        throw new Error(`依赖技能 semver 不满足: ${msg}`);
+      }
+
+      const incomingLock = await buildSkillLockfile(manifest, filesForIntegrity, {
+        requiresResolved: requiresSemver.details.map((d) => ({
+          skillId: d.skillId,
+          range: d.requestedRange,
+          resolvedVersion: d.resolvedVersion ?? '',
+          ok: d.ok
+        }))
+      });
       await this.skillStorage.open();
+      const existingInstall = await this.skillStorage.get(skill.id);
+      if (existingInstall?.lockfile && skillLockfilesEqual(existingInstall.lockfile, incomingLock)) {
+        this.auditSystem.record(AuditType.INSTALL_SKILL_COMPLETE, skill.id, 'success', {
+          outputs: { skipped: true, reason: 'skill_lockfile_unchanged' },
+          metadata: { lockfile: incomingLock }
+        });
+        devLog(`技能 ${skill.id} lockfile 未变，跳过重复安装`);
+        return;
+      }
+
+      codeFiles[SKILL_LOCKFILE_NAME] = serializeSkillLockfile(incomingLock);
       await this.skillStorage.deletePreflight(skill.id).catch(() => {});
 
       // Step 3: 保存到 IndexedDB
@@ -793,7 +941,8 @@ export class SkillInstaller {
         manifest,
         files: codeFiles,
         installedAt: new Date(),
-        repository: skill.repository
+        repository: skill.repository,
+        lockfile: incomingLock
       };
 
       // Step 3a: 保存到 IndexedDB (用于向量召回)
@@ -810,10 +959,10 @@ export class SkillInstaller {
             repository: skill.repository
           });
         } else {
-          console.warn('Skills directory not selected, skipping file system storage');
+          devWarn('Skills directory not selected, skipping file system storage');
         }
       } catch (error) {
-        console.warn('Failed to save skill to file system, continuing with IndexedDB only:', error);
+        devWarn('Failed to save skill to file system, continuing with IndexedDB only:', error);
       }
 
       // Step 4: 注册到 PluginManager

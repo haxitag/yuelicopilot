@@ -1,4 +1,5 @@
 import type { Message, ThinkingRecord, ToolCallRecord } from '../../types';
+import { coerceKgmStreamTextChunk } from './kgmAssistantContent';
 
 export type StreamSource = { name: string; type: string; url?: string };
 
@@ -149,6 +150,9 @@ export function reduceStreamEvent(prev: StreamReducerState, event: StreamEvent, 
       const { content, thinking, reasoning_content } = event.payload;
       if (typeof content === 'string' && content.length > 0) {
         state.accumulatedContent += content;
+      } else if (content != null && content !== '') {
+        const chunk = coerceKgmStreamTextChunk(content);
+        if (chunk.length > 0) state.accumulatedContent += chunk;
       }
       if (typeof thinking === 'string' && thinking.length > 0) {
         // keep the latest full thinking snapshot (providers often stream as prefix growth)

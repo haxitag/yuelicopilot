@@ -17,6 +17,7 @@ import { taskScheduler } from './core/TaskScheduler';
 import { sessionMemorySystem, SessionMemory } from './core/SessionMemory';
 import { subAgentExecutor, SubAgentExecutor, SubAgentTask, SubAgentResult, ParallelExecutionResult } from './core/SubAgentExecutor';
 import { resolveSkillExecutorBaseUrl } from '../utils/skillExecutorUrl';
+import { devLog, devWarn } from '../utils/devConsole';
 
 export interface SkillsServiceConfig {
   mcpServers?: MCPServerConfig[];
@@ -69,7 +70,7 @@ class SkillsService {
       }
 
       this.initialized = true;
-      console.log('[SkillsService] Initialized successfully');
+      devLog('[SkillsService] Initialized successfully');
     } catch (error) {
       console.error('[SkillsService] Initialization failed:', error);
       throw error;
@@ -106,7 +107,7 @@ class SkillsService {
     }
     
     this.webToolsRegistered = true;
-    console.log('[SkillsService] Web tools registered');
+    devLog('[SkillsService] Web tools registered');
   }
 
   private async connectMCPServers(servers: MCPServerConfig[]): Promise<void> {
@@ -117,9 +118,9 @@ class SkillsService {
         try {
           runtime.addServer(server);
           await runtime.connectServer(server.id);
-          console.log(`[SkillsService] MCP server connected: ${server.name}`);
+          devLog(`[SkillsService] MCP server connected: ${server.name}`);
         } catch (error) {
-          console.warn(`[SkillsService] Failed to connect MCP server ${server.name}:`, error);
+          devWarn(`[SkillsService] Failed to connect MCP server ${server.name}:`, error);
         }
       }
     }

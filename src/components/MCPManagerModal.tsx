@@ -3,6 +3,7 @@ import styled from 'styled-components';
 import { getMCPRuntime, MCPServerConfig, MCPServerStatus } from '../services/mcp/MCPRuntime';
 import { toast } from 'react-hot-toast';
 import { useSystemState } from '../contexts/SystemStateContext';
+import { useEscapeClose } from '../hooks/useEscapeClose';
 
 // ==================== Styled Components ====================
 
@@ -314,6 +315,7 @@ interface Props {
 }
 
 const MCPManagerModal: React.FC<Props> = ({ onClose }) => {
+  useEscapeClose(true, onClose);
   const { markReloadRequired } = useSystemState();
   const [tab, setTab] = useState<Tab>('servers');
   const [servers, setServers] = useState<MCPServerConfig[]>([]);
@@ -450,20 +452,20 @@ const MCPManagerModal: React.FC<Props> = ({ onClose }) => {
     <Overlay onClick={e => e.target === e.currentTarget && onClose()}>
       <Modal>
         <ModalHeader>
-          <ModalTitle>🔌 MCP 连接器管理</ModalTitle>
-          <Btn onClick={onClose}>✕ 关闭</Btn>
+          <ModalTitle>MCP 连接器</ModalTitle>
+          <Btn onClick={onClose}>关闭</Btn>
         </ModalHeader>
 
         <ModalBody>
           <Sidebar>
             <SidebarItem active={tab === 'servers'} onClick={() => setTab('servers')}>
-              📡 已配置 Servers ({servers.length})
+              Servers ({servers.length})
             </SidebarItem>
             <SidebarItem active={tab === 'add'} onClick={() => { setEditingId(null); setForm(defaultForm); setTab('add'); }}>
-              ➕ {editingId ? '编辑 Server' : '添加 Server'}
+              {editingId ? '编辑 Server' : '添加 Server'}
             </SidebarItem>
             <SidebarItem active={tab === 'tools'} onClick={() => setTab('tools')}>
-              🛠 可用工具 ({allTools.length})
+              工具 ({allTools.length})
             </SidebarItem>
           </Sidebar>
 
@@ -471,14 +473,11 @@ const MCPManagerModal: React.FC<Props> = ({ onClose }) => {
             {/* ===== Servers Tab ===== */}
             {tab === 'servers' && (
               <>
-                <SectionTitle>已配置的 MCP Servers</SectionTitle>
-                <InfoBox>
-                  MCP (Model Context Protocol) 允许 AI 调用外部工具。stdio 类型通过 KGM 后端代理运行，http/websocket 类型直接连接。
-                </InfoBox>
+                <SectionTitle>已配置 Servers</SectionTitle>
 
                 {servers.length === 0 ? (
                   <EmptyState>
-                    暂无配置的 MCP Server<br />
+                    暂无 MCP Server<br />
                     <Btn variant="primary" style={{ marginTop: 12 }} onClick={() => setTab('add')}>
                       添加第一个 Server
                     </Btn>
@@ -516,12 +515,12 @@ const MCPManagerModal: React.FC<Props> = ({ onClose }) => {
 
                         {server.description && <ServerDesc>{server.description}</ServerDesc>}
 
-                        {status?.error && <ErrorText>⚠ {status.error}</ErrorText>}
+                        {status?.error && <ErrorText>{status.error}</ErrorText>}
 
                         {status?.connected && status.tools.length > 0 && (
                           <TagList>
                             {status.tools.map(t => (
-                              <Tag key={t.name} title={t.description}>🔧 {t.name}</Tag>
+                              <Tag key={t.name} title={t.description}>{t.name}</Tag>
                             ))}
                           </TagList>
                         )}
@@ -587,8 +586,8 @@ const MCPManagerModal: React.FC<Props> = ({ onClose }) => {
                     value={form.type}
                     onChange={e => setForm(f => ({ ...f, type: e.target.value as any }))}
                   >
-                    <option value="stdio">stdio (通过 KGM 代理运行本地命令)</option>
-                    <option value="http">HTTP (直接 HTTP 请求)</option>
+                    <option value="stdio">stdio</option>
+                    <option value="http">HTTP</option>
                     <option value="sse">SSE (Server-Sent Events)</option>
                     <option value="websocket">WebSocket</option>
                   </Select>
@@ -675,7 +674,7 @@ const MCPManagerModal: React.FC<Props> = ({ onClose }) => {
                 </BtnRow>
 
                 <div style={{ marginTop: 24, padding: '12px 16px', background: '#f9f9f9', borderRadius: 8, fontSize: 13, color: '#666' }}>
-                  <strong>常用 MCP Servers：</strong><br />
+                    <strong>常用 Servers</strong><br />
                   • 文件系统: <code>npx -y @modelcontextprotocol/server-filesystem /path</code><br />
                   • Brave 搜索: <code>npx -y @modelcontextprotocol/server-brave-search</code><br />
                   • SQLite: <code>npx -y @modelcontextprotocol/server-sqlite --db-path /tmp/db.sqlite</code><br />
@@ -691,13 +690,13 @@ const MCPManagerModal: React.FC<Props> = ({ onClose }) => {
                 {allTools.length === 0 ? (
                   <EmptyState>
                     暂无可用工具<br />
-                    请先连接 MCP Server
+                    请先连接 Server
                   </EmptyState>
                 ) : (
                   allTools.map(tool => (
                     <ServerCard key={`${tool.serverId}:${tool.name}`}>
                       <ServerHeader>
-                        <ServerName>🔧 {tool.name}</ServerName>
+                        <ServerName>{tool.name}</ServerName>
                         <Tag>{tool.serverId}</Tag>
                       </ServerHeader>
                       <ServerDesc>{tool.description}</ServerDesc>

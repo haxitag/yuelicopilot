@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { PluginDependency, RepositoryInfo } from '../../types';
+import type { SkillLockfile } from './skillLockfile';
 
 const runtimeSchema = z
   .object({
@@ -66,6 +67,27 @@ const dependenciesSchema = z
   .union([z.array(z.string()), dependenciesStructuredSchema])
   .optional();
 
+const triggersSchema = z
+  .object({
+    keywords: z.array(z.string()).default([]),
+    intent_patterns: z.array(z.string()).default([])
+  })
+  .optional();
+
+const pipelineInputBindingSchema = z.object({
+  fromSkill: z.string(),
+  as: z.string().optional(),
+  paths: z.array(z.string()).optional(),
+  required: z.boolean().optional()
+});
+
+const pipelineSchema = z
+  .object({
+    /** 从已执行的上游 skill 结构化产出映射到本 skill 的输入 */
+    inputs: z.array(pipelineInputBindingSchema).optional()
+  })
+  .optional();
+
 /** Zod 校验后的技能 manifest（含 .passthrough 保留未知字段） */
 export const SkillManifestSchema = z
   .object({
@@ -76,6 +98,12 @@ export const SkillManifestSchema = z
     description: z.string(),
     category: z.string().optional(),
     tags: z.array(z.string()).optional(),
+    triggers: triggersSchema,
+    /** pre_llm 管道内拓扑依赖：先于本 skill 执行的其它 skill id（仅作用于 skillsPrePipeline 排序）；可写 `id@^1.0.0` */
+    requires: z.array(z.string()).optional(),
+    /** 依赖 skill 的 semver 范围，如 `{ "other-skill": "^1.0.0" }` */
+    requiresSemver: z.record(z.string()).optional(),
+    pipeline: pipelineSchema,
     permissions: z.array(z.string()).optional(),
     dependencies: dependenciesSchema,
     tools: z.array(toolDefSchema).optional(),
@@ -96,6 +124,8 @@ export interface InstalledSkillData {
   files: Record<string, string>;
   installedAt: Date;
   repository?: RepositoryInfo;
+  /** 安装锁：manifest + 包载荷指纹，用于跳过重复安装 */
+  lockfile?: SkillLockfile;
 }
 
 export interface ManifestNormalizationResult {
@@ -158,6 +188,39 @@ export function migrateLegacyManifest(raw: unknown): Record<string, unknown> {
     if (perms.some((p) => p.includes('file'))) caps.filesystem = true;
     if (perms.some((p) => p.includes('process') || p.includes('execute'))) caps.process = true;
     if (Object.keys(caps).length > 0) next.capabilities = caps;
+  }
+
+  if (!next.requires && Array.isArray(o.requires)) {
+    next.requires = o.requires.map(String).filter(Boolean);
+  }
+
+  if (!next.triggers && typeof o.triggers === 'object' && o.triggers !== null) {
+    next.triggers = o.triggers;
+  } else if (!next.triggers) {
+    const keywords: string[] = [];
+    if (typeof o.name === 'string' && o.name.trim()) keywords.push(o.name.trim());
+    if (Array.isArray(o.tags)) {
+      for (const t of o.tags) keywords.push(String(t));
+    }
+    if (keywords.length > 0) {
+      next.triggers = { keywords, intent_patterns: [] };
+    }
+  }
+
+  if (!next.runtime && (!o.tools || (Array.isArray(o.tools) && o.tools.length === 0))) {
+    const hasEntry = typeof o.entry === 'string' && o.entry.trim();
+    if (!hasEntry && (o.systemPrompt || o.description)) {
+      next.runtime = { type: 'prompt' };
+    }
+  }
+
+  const runtimeObj = next.runtime as { type?: string } | undefined;
+  if (!next.context_injection && runtimeObj?.type === 'prompt') {
+    next.context_injection = { mode: 'pre_llm' };
+  }
+
+  if (!next.execution && runtimeObj?.type === 'prompt') {
+    next.execution = { profile: 'process_host' };
   }
 
   return next;

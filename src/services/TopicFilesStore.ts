@@ -25,10 +25,21 @@ export interface TopicFileMeta {
   content?: string;
 }
 
-export interface TopicLike {
+/** 本机工作区目录（与 topic.id 绑定，服务端 sessionId = workspace:{id}） */
+export interface TopicWorkspaceMeta {
+  workspaceRoot?: string;
+  workspaceLastScanAt?: number;
+  workspaceIndexedCount?: number;
+}
+
+export interface TopicLike extends TopicWorkspaceMeta {
   id: string;
+  name?: string;
+  description?: string;
   files?: TopicFileMeta[];
-  [key: string]: any;
+  instructions?: string[];
+  lastActive?: number;
+  [key: string]: unknown;
 }
 
 interface StoredFileRecord {

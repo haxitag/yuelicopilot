@@ -10,6 +10,7 @@ import {
   PluginEvent,
   UpdateScheduleConfig
 } from '../../types';
+import { devLog } from '../../utils/devConsole';
 
 /**
  * 定时任务管理器
@@ -502,7 +503,7 @@ export class ScheduleManager {
    */
   private async executePlugin(task: ScheduleTask, context: any): Promise<any> {
     // 这里只是占位，实际应该调用CoreOrchestrator的processInput或类似方法
-    console.log(`Executing ${task.pluginType} ${task.pluginId}:`, task.name);
+    devLog(`Executing ${task.pluginType} ${task.pluginId}:`, task.name);
     return { success: true, task: task.taskId };
   }
 
@@ -590,7 +591,7 @@ export class ScheduleManager {
    * 执行更新（占位方法）
    */
   private async executeUpdate(schedule: UpdateScheduleConfig): Promise<any> {
-    console.log(`Updating ${schedule.pluginType} ${schedule.pluginId}`);
+    devLog(`Updating ${schedule.pluginType} ${schedule.pluginId}`);
     return { updated: true, timestamp: new Date() };
   }
 

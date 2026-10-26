@@ -18,6 +18,7 @@ import { SkillStorage } from './SkillStorage';
 import { runPreflightWithCache } from './SkillPreflight';
 import { normalizeSkillManifest } from './SkillManifestSchema';
 import type { SkillManifest } from './SkillManifestSchema';
+import { devLog, devWarn } from '../../utils/devConsole';
 
 /**
  * 插件管理器 - 负责技能和连接器的完整生命周期管理
@@ -174,18 +175,20 @@ export class PluginManager {
       await storage.open();
       const installed = await storage.get(skillId);
       const manifestRaw = opts?.manifest ?? installed?.manifest;
-      if (manifestRaw) {
-        const n = normalizeSkillManifest(manifestRaw);
-        if (n.ok) {
-          const pf = await runPreflightWithCache(skillId, n.manifest, storage);
-          if (!pf.ok) {
-            const detail = pf.checks
-              .filter((c) => !c.ok)
-              .map((c) => `${c.name}${c.detail ? `: ${c.detail}` : ''}`)
-              .join('; ');
-            throw new Error(detail ? `技能预检未通过：${detail}` : '技能预检未通过');
-          }
-        }
+      if (!manifestRaw) {
+        throw new Error(`技能 ${skillId} 缺少 manifest，无法完成 Mount 预检。请先安装或重新同步技能包。`);
+      }
+      const n = normalizeSkillManifest(manifestRaw);
+      if (!n.ok) {
+        throw new Error(`技能 manifest 无效：${n.errors.join('; ')}`);
+      }
+      const pf = await runPreflightWithCache(skillId, n.manifest, storage);
+      if (!pf.ok) {
+        const detail = pf.checks
+          .filter((c) => !c.ok)
+          .map((c) => `${c.name}${c.detail ? `: ${c.detail}` : ''}`)
+          .join('; ');
+        throw new Error(detail ? `技能预检未通过：${detail}` : '技能预检未通过');
       }
     }
 
@@ -554,7 +557,7 @@ export class PluginManager {
         await this.attemptRecovery(pluginId, pluginType);
         break;
       case ErrorLevel.WARNING:
-        console.warn('Warning, continuing execution');
+        devWarn('Warning, continuing execution');
         break;
     }
   }
@@ -566,7 +569,7 @@ export class PluginManager {
     pluginId: string,
     pluginType: 'skill' | 'connector'
   ): Promise<boolean> {
-    console.log(`Attempting to recover`, pluginType, pluginId);
+    devLog(`Attempting to recover`, pluginType, pluginId);
     
     // 简单的恢复策略
     await new Promise(resolve => setTimeout(resolve, 1000));

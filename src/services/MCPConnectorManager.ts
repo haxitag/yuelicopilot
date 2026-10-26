@@ -1,6 +1,7 @@
 import { MCPConnector, MCPConnectorConfig, MCPQuery, MCPResponse } from '../types';
 import { DatabaseConnector, FileSystemConnector, HttpApiConnector } from './mcp/RealConnectors';
 import { getMCPRuntime } from './mcp/MCPRuntime';
+import { devWarn } from '../utils/devConsole';
 
 export class MCPConnectorManager {
   private connectors: Map<string, MCPConnector> = new Map();
@@ -197,7 +198,7 @@ export class MCPConnectorManager {
     const ok = await apiConnector.testConnection();
     if (!ok) {
       // 不强制失败，API 可能不支持 GET /
-      console.warn(`API connector ${connector.id} test connection returned non-ok, proceeding anyway`);
+      devWarn(`API connector ${connector.id} test connection returned non-ok, proceeding anyway`);
     }
     this.apiConnectors.set(connector.id, apiConnector);
   }
@@ -226,7 +227,7 @@ export class MCPConnectorManager {
     // 尝试请求文件系统访问权限
     const hasAccess = await fsConnector.requestDirectoryAccess();
     if (!hasAccess) {
-      console.warn('File System Access API not available, will use KGM proxy for file operations');
+      devWarn('File System Access API not available, will use KGM proxy for file operations');
     }
 
     this.fsConnectors.set(connector.id, fsConnector);

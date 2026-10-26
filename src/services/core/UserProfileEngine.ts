@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { devLog } from '../../utils/devConsole';
 
 export interface UserPreference {
   category: string;
@@ -83,7 +84,7 @@ class UserProfileEngine {
 
     this.loadStore();
     this.initialized = true;
-    console.log('[UserProfile] Initialized with', Object.keys(this.store.profiles).length, 'profiles');
+    devLog('[UserProfile] Initialized with', Object.keys(this.store.profiles).length, 'profiles');
   }
 
   private getStorePath(): string {

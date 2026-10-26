@@ -1,0 +1,30 @@
+/**
+ * Copilot 聊天正文排版：在 deck 默认行高/段距基础上 +20%
+ */
+.chat-message-content {
+  line-height: 1.68; /* 1.4 × 1.2 */
+}
+
+.chat-message-content .wmde-markdown {
+  line-height: 1.92; /* 1.6 × 1.2 */
+}
+
+.chat-message-content .wmde-markdown p {
+  margin: 9.6px 0 !important; /* 8px × 1.2 */
+  line-height: 1.92 !important;
+}
+
+.chat-message-content .wmde-markdown li {
+  margin-bottom: 4.8px !important; /* 4px × 1.2 */
+  line-height: 1.92 !important;
+}
+
+.chat-message-content .wmde-markdown ul,
+.chat-message-content .wmde-markdown ol {
+  margin: 9.6px 0 !important;
+}
+
+.chat-message-content .wmde-markdown table th,
+.chat-message-content .wmde-markdown table td {
+  line-height: 1.68 !important; /* 1.4 × 1.2 */
+}

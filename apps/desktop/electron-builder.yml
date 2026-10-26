@@ -1,0 +1,43 @@
+appId: com.yueli.copilot
+productName: Yueli Copilot
+copyright: Copyright © 2026 Yueli
+
+directories:
+  buildResources: build
+  output: ../../release/desktop
+
+# 签名完成后公证（macOS；凭据见 .notarize.env 或 CI Secrets）
+afterSign: scripts/notarize.cjs
+
+asar: true
+asarUnpack:
+  - "**/*.node"
+
+files:
+  - electron/**/*
+  - package.json
+
+extraResources:
+  - from: build/icon.png
+    to: icon.png
+  - from: ../../build/electron-staging
+    to: app
+    filter:
+      - "**/*"
+
+mac:
+  icon: build/icon.icns
+  category: public.app-category.developer-tools
+  target:
+    - target: dmg
+      arch:
+        - arm64
+  hardenedRuntime: true
+  gatekeeperAssess: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  # 默认自动发现 Developer ID；固定证书: CSC_NAME
+  # 本地无证书调试: CSC_IDENTITY_AUTO_DISCOVERY=false
+
+dmg:
+  title: ${productName} ${version}

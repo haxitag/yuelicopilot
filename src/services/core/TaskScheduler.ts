@@ -12,6 +12,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { EventEmitter } from 'events';
 import cron from 'node-cron';
+import { devLog } from '../../utils/devConsole';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -96,9 +97,9 @@ class TaskScheduler extends EventEmitter {
         }
       }
 
-      console.log(`[TaskScheduler] Loaded ${this.tasks.size} tasks`);
+      devLog(`[TaskScheduler] Loaded ${this.tasks.size} tasks`);
     } catch {
-      console.log('[TaskScheduler] No existing tasks found');
+      devLog('[TaskScheduler] No existing tasks found');
     }
   }
 
@@ -377,7 +378,7 @@ class TaskScheduler extends EventEmitter {
       }
     }
 
-    console.log('[TaskScheduler] Started');
+    devLog('[TaskScheduler] Started');
     this.emit('scheduler:started');
   }
 
@@ -387,7 +388,7 @@ class TaskScheduler extends EventEmitter {
     }
     this.cronJobs.clear();
     this.isRunning = false;
-    console.log('[TaskScheduler] Stopped');
+    devLog('[TaskScheduler] Stopped');
     this.emit('scheduler:stopped');
   }
 }

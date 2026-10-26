@@ -5,6 +5,7 @@
  */
 
 import type { RepositoryInfo } from '../../types';
+import { devWarn } from '../../utils/devConsole';
 import { SkillManifest } from './SkillInstaller';
 
 export interface SkillFileData {
@@ -64,13 +65,13 @@ export class SkillFileSystem {
         }
       }
     } catch (error) {
-      console.warn('Failed to restore skills directory handle:', error);
+      devWarn('Failed to restore skills directory handle:', error);
     }
   }
 
   async selectSkillsDirectory(): Promise<boolean> {
     if (typeof window === 'undefined' || !('showDirectoryPicker' in window)) {
-      console.warn('File System Access API not supported');
+      devWarn('File System Access API not supported');
       return false;
     }
 
@@ -244,7 +245,7 @@ export class SkillFileSystem {
       try {
         await this.rootHandle.removeEntry(skillId, { recursive: true });
       } catch (error) {
-        console.warn(`Failed to delete skill directory ${skillId}:`, error);
+        devWarn(`Failed to delete skill directory ${skillId}:`, error);
       }
     }
 
@@ -278,7 +279,7 @@ export class SkillFileSystem {
 
       return skillIds;
     } catch (error) {
-      console.warn('Failed to list skills from filesystem:', error);
+      devWarn('Failed to list skills from filesystem:', error);
       return [];
     }
   }
@@ -295,7 +296,7 @@ export class SkillFileSystem {
       const content = await file.text();
       return JSON.parse(content);
     } catch (error) {
-      console.warn(`Failed to read manifest for skill ${skillId}:`, error);
+      devWarn(`Failed to read manifest for skill ${skillId}:`, error);
       return null;
     }
   }

@@ -1,3 +1,5 @@
+import { devLog } from './devConsole';
+
 const PORT_MIGRATION_KEY = 'yueli_port_migration_v1';
 const CURRENT_PORT_KEY = 'yueli_last_port';
 const EXPORT_KEY = 'yueli_data_export';
@@ -19,12 +21,12 @@ export function migrateFromOldPort(newPort: number): void {
       const timeSinceLastMigration = now - data.lastTimestamp;
 
       if (data.lastPort === newPort) {
-        console.log('[PortMigration] 同一端口，无需迁移');
+        devLog('[PortMigration] 同一端口，无需迁移');
         return;
       }
 
       if (timeSinceLastMigration < 60000) {
-        console.log('[PortMigration] 60秒内已迁移过，跳过');
+        devLog('[PortMigration] 60秒内已迁移过，跳过');
         return;
       }
     }
@@ -46,7 +48,7 @@ export function migrateFromOldPort(newPort: number): void {
     };
 
     localStorage.setItem(PORT_MIGRATION_KEY, JSON.stringify(migrationRecord));
-    console.log('[PortMigration] 端口迁移数据已保存:', { from: migrationData ? JSON.parse(migrationData).lastPort : 'unknown', to: newPort, keysCount: Object.keys(allData).length });
+    devLog('[PortMigration] 端口迁移数据已保存:', { from: migrationData ? JSON.parse(migrationData).lastPort : 'unknown', to: newPort, keysCount: Object.keys(allData).length });
 
   } catch (error) {
     console.error('[PortMigration] 迁移失败:', error);
@@ -57,18 +59,18 @@ export function restoreFromMigration(newPort: number): boolean {
   try {
     const migrationData = localStorage.getItem(PORT_MIGRATION_KEY);
     if (!migrationData) {
-      console.log('[PortMigration] 无迁移数据');
+      devLog('[PortMigration] 无迁移数据');
       return false;
     }
 
     const data: PortMigrationData = JSON.parse(migrationData);
 
     if (data.lastPort === newPort) {
-      console.log('[PortMigration] 已是最新端口');
+      devLog('[PortMigration] 已是最新端口');
       return false;
     }
 
-    console.log('[PortMigration] 开始恢复数据 from port', data.lastPort, 'to', newPort, '共', Object.keys(data.allData || {}).length, '项');
+    devLog('[PortMigration] 开始恢复数据 from port', data.lastPort, 'to', newPort, '共', Object.keys(data.allData || {}).length, '项');
 
     if (data.allData) {
       Object.entries(data.allData).forEach(([key, value]) => {
@@ -76,7 +78,7 @@ export function restoreFromMigration(newPort: number): boolean {
       });
     }
 
-    console.log('[PortMigration] 数据恢复成功');
+    devLog('[PortMigration] 数据恢复成功');
     return true;
 
   } catch (error) {
@@ -108,7 +110,7 @@ export function checkAndMigratePort(): void {
 
 export function triggerManualMigration(fromPort: number, toPort: number): boolean {
   try {
-    console.log(`[PortMigration] 手动触发迁移: ${fromPort} -> ${toPort}`);
+    devLog(`[PortMigration] 手动触发迁移: ${fromPort} -> ${toPort}`);
 
     const allKeys = Object.keys(localStorage);
     const allData: Record<string, string> = {};
@@ -119,7 +121,7 @@ export function triggerManualMigration(fromPort: number, toPort: number): boolea
       if (value) {
         allData[key] = value;
         migratedCount++;
-        console.log(`[PortMigration] 迁移 key: ${key}`);
+        devLog(`[PortMigration] 迁移 key: ${key}`);
       }
     });
 
@@ -130,7 +132,7 @@ export function triggerManualMigration(fromPort: number, toPort: number): boolea
     };
 
     localStorage.setItem(PORT_MIGRATION_KEY, JSON.stringify(migrationRecord));
-    console.log(`[PortMigration] 手动迁移完成，共迁移 ${migratedCount} 项数据`);
+    devLog(`[PortMigration] 手动迁移完成，共迁移 ${migratedCount} 项数据`);
     return true;
 
   } catch (error) {
@@ -159,7 +161,7 @@ export function exportAllData(): string {
     };
 
     const jsonString = JSON.stringify(exportData, null, 2);
-    console.log(`[PortMigration] 导出完成，共 ${Object.keys(allData).length} 项数据`);
+    devLog(`[PortMigration] 导出完成，共 ${Object.keys(allData).length} 项数据`);
 
     return jsonString;
 
@@ -184,8 +186,8 @@ export function importAllData(jsonString: string): boolean {
       importedCount++;
     });
 
-    console.log(`[PortMigration] 导入完成，共 ${importedCount} 项数据`);
-    console.log('[PortMigration] 请刷新页面以加载数据');
+    devLog(`[PortMigration] 导入完成，共 ${importedCount} 项数据`);
+    devLog('[PortMigration] 请刷新页面以加载数据');
     return true;
 
   } catch (error) {
@@ -212,7 +214,7 @@ export function downloadExportedData(): void {
     document.body.removeChild(link);
     URL.revokeObjectURL(url);
 
-    console.log('[PortMigration] 文件已下载');
+    devLog('[PortMigration] 文件已下载');
 
   } catch (error) {
     console.error('[PortMigration] 下载失败:', error);
@@ -242,27 +244,27 @@ export function uploadAndImportData(file: File): Promise<boolean> {
 
 export function clearMigrationData(): void {
   localStorage.removeItem(PORT_MIGRATION_KEY);
-  console.log('[PortMigration] 迁移数据已清除');
+  devLog('[PortMigration] 迁移数据已清除');
 }
 
 export function showMigrationData(): void {
   const migrationData = localStorage.getItem(PORT_MIGRATION_KEY);
   if (migrationData) {
     const data = JSON.parse(migrationData);
-    console.log('[PortMigration] 当前迁移数据:', data);
-    console.log('[PortMigration] 包含的 keys:', Object.keys(data.allData || {}));
+    devLog('[PortMigration] 当前迁移数据:', data);
+    devLog('[PortMigration] 包含的 keys:', Object.keys(data.allData || {}));
   } else {
-    console.log('[PortMigration] 无迁移数据');
+    devLog('[PortMigration] 无迁移数据');
   }
 }
 
 export function showAllLocalStorage(): void {
   const allKeys = Object.keys(localStorage);
-  console.log(`[PortMigration] 当前 localStorage 共 ${allKeys.length} 项数据:`);
+  devLog(`[PortMigration] 当前 localStorage 共 ${allKeys.length} 项数据:`);
   allKeys.forEach(key => {
     const value = localStorage.getItem(key);
     const preview = value && value.length > 100 ? value.substring(0, 100) + '...' : value;
-    console.log(`  ${key}: ${preview}`);
+    devLog(`  ${key}: ${preview}`);
   });
 }
 
@@ -278,13 +280,13 @@ export function showAllLocalStorage(): void {
 (window as any).showMigrationData = showMigrationData;
 (window as any).showAllLocalStorage = showAllLocalStorage;
 
-console.log('[PortMigration] 端口迁移工具已加载');
-console.log('[PortMigration] 可用命令:');
-console.log('[PortMigration]   triggerPortMigration(from, to)   - 执行迁移');
-console.log('[PortMigration]   exportAllData()                 - 导出所有数据到控制台');
-console.log('[PortMigration]   downloadExportedData()            - 下载数据文件');
-console.log('[PortMigration]   importAllData(jsonString)        - 从JSON导入');
-console.log('[PortMigration]   uploadAndImportData(file)        - 上传文件导入');
-console.log('[PortMigration]   showAllLocalStorage()            - 查看所有数据');
-console.log('[PortMigration]   showMigrationData()              - 查看迁移数据');
-console.log('[PortMigration]   clearMigrationData()             - 清除迁移数据');
+devLog('[PortMigration] 端口迁移工具已加载');
+devLog('[PortMigration] 可用命令:');
+devLog('[PortMigration]   triggerPortMigration(from, to)   - 执行迁移');
+devLog('[PortMigration]   exportAllData()                 - 导出所有数据到控制台');
+devLog('[PortMigration]   downloadExportedData()            - 下载数据文件');
+devLog('[PortMigration]   importAllData(jsonString)        - 从JSON导入');
+devLog('[PortMigration]   uploadAndImportData(file)        - 上传文件导入');
+devLog('[PortMigration]   showAllLocalStorage()            - 查看所有数据');
+devLog('[PortMigration]   showMigrationData()              - 查看迁移数据');
+devLog('[PortMigration]   clearMigrationData()             - 清除迁移数据');

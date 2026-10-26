@@ -26,6 +26,15 @@ export interface PermissionAuditEntry {
   at: number;
 }
 
+/** 推理路由可观测（消息级 RouteTrace） */
+export interface RouteTraceInfo {
+  tier?: 'L1' | 'L2' | 'L3';
+  vendor?: string;
+  displayModel?: string;
+  l2ProviderPath?: string;
+  transportFallback?: string;
+}
+
 /** 单轮对话推理调用侧指标（来自 apiService.sendOllamaMessageWithMessages） */
 export interface MessageMetrics {
   /** Provider HTTP 往返次数（含工具循环内的多轮 completion） */
@@ -38,6 +47,8 @@ export interface MessageMetrics {
   completionTokens?: number;
   /** 合计 token（同上） */
   totalTokens?: number;
+  /** 本轮推理路由 tier / upstream / 回退链 */
+  routeTrace?: RouteTraceInfo;
 }
 
 export type OrchestratorStage = 'analyze' | 'prepare' | 'execute' | 'transform' | 'complete' | 'error';
@@ -174,7 +185,7 @@ export interface StreamChunk {
 
 // ==================== Skills相关类型 ====================
 
-export type SkillCategory = 
+export type SkillCategory =
   | 'coding'           // 代码生成和分析
   | 'writing'          // 文本创作和优化
   | 'analysis'         // 数据分析和处理
@@ -182,6 +193,8 @@ export type SkillCategory =
   | 'database'         // 数据库操作
   | 'file'             // 文件处理
   | 'web'              // 网页和API交互
+  | 'research'         // 联网检索与实时研究
+  | 'knowledge'        // 桌面知识 / RAG / 工作区
   | 'productivity'     // 生产力工具
   | 'system'           // 系统约束类技能
   | 'other';           // 其他
@@ -239,8 +252,9 @@ export interface SkillExecutionContext {
 
 // ==================== 权限系统 ====================
 
-export type SkillPermission = 
+export type SkillPermission =
   | 'file.read'
+  | 'filesystem.read'
   | 'file.write'
   | 'file.delete'
   | 'network.http'
@@ -315,7 +329,32 @@ export interface SkillCollection {
 
 export interface LocalSkillSource {
   directory: string;
-  platform: 'trae' | 'claude-code' | 'cursor' | 'other' | 'skills-manage' | 'custom' | 'codex' | 'copilot' | 'codewhisperer' | 'tabnine' | 'yueli';
+  platform:
+    | 'trae'
+    | 'claude-code'
+    | 'cursor'
+    | 'other'
+    | 'skills-manage'
+    | 'custom'
+    | 'codex'
+    | 'copilot'
+    | 'codewhisperer'
+    | 'tabnine'
+    | 'yueli'
+    | 'openclaw'
+    | 'windsurf'
+    | 'gemini'
+    | 'roo'
+    | 'augment'
+    | 'zed'
+    | 'forge'
+    | 'antigravity'
+    | 'opencode'
+    | 'qoder'
+    | 'codebuddy'
+    | 'iflow'
+    | 'qwen'
+    | 'kiro';
   skills: Array<{
     id: string;
     path: string;
@@ -415,6 +454,10 @@ export interface ExecutionResult {
   connectorResults?: Record<string, MCPResponse>;
   renderedOutput?: RenderedOutput;
   error?: string;
+  /** 预 LLM 技能结果拼接后的用户可见增强输入 */
+  enhancedUserPrompt?: string;
+  /** 应注册为对话 tools 的技能 id（context_injection post_llm / bidirectional） */
+  toolEligibleSkillIds?: string[];
 }
 
 // ==================== 完整架构类型扩展 ====================
@@ -532,6 +575,7 @@ export type SkillRepositoryKind =
   | 'skillhub'
   | 'tencent_skillhub'
   | 'skillhub_wtf'
+  | 'skillpkg'
   | 'local';
 
 // 插件元数据

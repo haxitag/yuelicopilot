@@ -222,6 +222,7 @@ export class PermissionManager {
   getPermissionDescription(permission: SkillPermission): string {
     const descriptions: Record<SkillPermission, string> = {
       'file.read': '读取文件',
+      'filesystem.read': '读取本机目录（工作区扫描）',
       'file.write': '写入文件',
       'file.delete': '删除文件',
       'network.http': '发送HTTP请求',

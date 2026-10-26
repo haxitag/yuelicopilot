@@ -10,6 +10,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { devLog } from '../../utils/devConsole';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -18,11 +19,17 @@ export interface SkillExecutionFeedback {
   skillName: string;
   timestamp: Date;
   durationMs: number;
+  execution_ms?: number;
   success: boolean;
   error?: string;
   args: Record<string, any>;
   resultSize?: number;
-  userRating?: number;  // 用户反馈评分 1-5
+  userRating?: number;
+  result_valid?: boolean;
+  tokens_injected?: number;
+  schema_pass_rate?: number;
+  tool_round_count?: number;
+  phase?: string;
 }
 
 export interface SkillEvolution {
@@ -33,6 +40,14 @@ export interface SkillEvolution {
   failedExecutions: number;
   successRate: number;
   avgDurationMs: number;
+  avgExecutionMs?: number;
+  totalTokensInjected?: number;
+  avgTokensInjected?: number;
+  totalToolRounds?: number;
+  avgToolRoundCount?: number;
+  schemaValidCount?: number;
+  schemaInvalidCount?: number;
+  schemaPassRate?: number;
   lastUsed: Date;
   firstUsed: Date;
   recentErrors: string[];
@@ -139,10 +154,36 @@ class SkillEvolutionEngine {
     }
 
     evolution.successRate = evolution.successfulExecutions / evolution.totalExecutions;
-    evolution.avgDurationMs = (
-      (evolution.avgDurationMs * (evolution.totalExecutions - 1) + feedback.durationMs)
-      / evolution.totalExecutions
-    );
+    const execMs = feedback.execution_ms ?? feedback.durationMs;
+    evolution.avgDurationMs =
+      (evolution.avgDurationMs * (evolution.totalExecutions - 1) + execMs) / evolution.totalExecutions;
+    evolution.avgExecutionMs = evolution.avgDurationMs;
+
+    const tokens = feedback.tokens_injected ?? 0;
+    if (tokens > 0) {
+      evolution.totalTokensInjected = (evolution.totalTokensInjected ?? 0) + tokens;
+      evolution.avgTokensInjected = evolution.totalTokensInjected / evolution.totalExecutions;
+    }
+
+    const rounds = feedback.tool_round_count ?? 0;
+    evolution.totalToolRounds = (evolution.totalToolRounds ?? 0) + rounds;
+    evolution.avgToolRoundCount = evolution.totalToolRounds / evolution.totalExecutions;
+
+    if (typeof feedback.result_valid === 'boolean') {
+      evolution.schemaValidCount = evolution.schemaValidCount ?? 0;
+      evolution.schemaInvalidCount = evolution.schemaInvalidCount ?? 0;
+      if (feedback.result_valid) evolution.schemaValidCount++;
+      else evolution.schemaInvalidCount++;
+      const st = evolution.schemaValidCount + evolution.schemaInvalidCount;
+      evolution.schemaPassRate = st > 0 ? evolution.schemaValidCount / st : 1;
+    } else if (typeof feedback.schema_pass_rate === 'number') {
+      evolution.schemaValidCount = evolution.schemaValidCount ?? 0;
+      evolution.schemaInvalidCount = evolution.schemaInvalidCount ?? 0;
+      if (feedback.schema_pass_rate >= 1) evolution.schemaValidCount++;
+      else evolution.schemaInvalidCount++;
+      const st = evolution.schemaValidCount + evolution.schemaInvalidCount;
+      evolution.schemaPassRate = st > 0 ? evolution.schemaValidCount / st : 1;
+    }
 
     this.store.evolutions[feedback.skillId] = evolution;
     this.store.feedbacks.push(feedback);
@@ -235,7 +276,7 @@ class SkillEvolutionEngine {
   async recordUserRating(skillId: string, rating: number): Promise<void> {
     const evolution = this.store.evolutions[skillId];
     if (evolution) {
-      console.log(`[SkillEvolution] User rated ${skillId}: ${rating}/5`);
+      devLog(`[SkillEvolution] User rated ${skillId}: ${rating}/5`);
       await this.saveStore();
     }
   }

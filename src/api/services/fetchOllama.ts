@@ -1,7 +1,9 @@
 // 测试使用原生fetch调用Ollama API
+import { devLog } from '../../utils/devConsole';
+
 export async function testFetchOllama(model: string, message: string, onData: (data: any) => void) {
   try {
-    console.log('使用fetch发送Ollama消息:', { model, message });
+    devLog('使用fetch发送Ollama消息:', { model, message });
     
     const response = await fetch('http://localhost:11434/api/chat', {
       method: 'POST',

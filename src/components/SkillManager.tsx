@@ -3,6 +3,12 @@ import styled from 'styled-components';
 import { useNavigate } from 'react-router-dom';
 import { toast } from 'react-hot-toast';
 import { debugManager } from '../services/DebugManager';
+import { devLog } from '../utils/devConsole';
+import { readCloudProvidersFromLocalStorage, type CloudProviderRow } from '../utils/defaultCloudProviders';
+import { saveCloudProvidersWithKgmSync } from '../utils/cloudProviderSaveSync';
+import { normalizeCloudProvidersModelsForStorage } from '../utils/cloudLlmPresetModels';
+import { getSecret, setSecret } from '../utils/secretStore';
+import CloudProvidersConfigPanel from './CloudProvidersConfigPanel';
 import {
   AppstoreOutlined,
   ClockCircleOutlined,
@@ -68,6 +74,11 @@ import { CoreOrchestratorV2, getDefaultOrchestrator, SkillInstaller, DiscoveredS
 import { SkillExecutor } from '../services/SkillExecutor';
 import { SkillStorage } from '../services/core/SkillStorage';
 import { resolveSkillExecutorAuthHeaders, resolveSkillExecutorBaseUrl } from '../utils/skillExecutorUrl';
+import {
+  fetchAbExperiment,
+  fetchAbStats,
+  saveAbExperimentConfig
+} from '../services/core/skillEvolutionAb';
 import MCPManagerModal from './MCPManagerModal';
 import { normalizeSkillManifest } from '../services/core/SkillManifestSchema';
 import { runPreflightWithCache, type PreflightResult } from '../services/core/SkillPreflight';
@@ -88,12 +99,20 @@ import {
 import { CollectionManager } from '../services/core/CollectionManager';
 import { LocalSkillScanner } from '../services/core/LocalSkillScanner';
 import { apiService } from '../api/services/apiService';
+import { readOllamaThinkModePreference } from '../api/services/ollamaThinkOptions';
 import { promptRegistry, PromptTemplate, PromptCategory, PromptUpdatePayload } from '../services/PromptRegistry';
 import { persistTopicsToStorage as persistTopicsForSkillManager } from '../services/TopicFilesStore';
+import {
+  scanAndPersistTopicWorkspace,
+  clearLegacyWorkspaceLocalStorage
+} from '../services/desktopKnowledge/topicWorkspace';
+import { pickDirectoryViaDesktop } from '../utils/desktopDirectoryPicker';
+import { migrateSessionMessagesStore } from '../services/chat/sessionMessagesMigration';
 import { useSystemState } from '../contexts/SystemStateContext';
 
 
 const { Option } = Select;
+const { TextArea } = Input;
 
 // 样式组件
 const Container = styled.div`
@@ -193,7 +212,7 @@ const SkillManager: React.FC = () => {
   // 插件相关状态
   const [plugins, setPlugins] = useState<any[]>([]);
   const [activeCategory, setActiveCategory] = useState<SkillCategory | 'all'>('all');
-  const [selectedCollection, setSelectedCollection] = useState<string | null>(null);
+  const [selectedCollection, setSelectedCollection] = useState<string>('');
   
   // 任务相关状态
   const [tasks, setTasks] = useState<any[]>([]);
@@ -250,8 +269,8 @@ const SkillManager: React.FC = () => {
   const [localSkills, setLocalSkills] = useState<LocalSkillSource[]>([]);
   const [scanningLocal, setScanningLocal] = useState(false);
   const [localSkillScanner, setLocalSkillScanner] = useState<LocalSkillScanner | null>(null);
-  const [localScanPath, setLocalScanPath] = useState('/Users/yr.z/work/skills');
-  
+  const [localScanPath] = useState('/Users/yr.z/work/skills');
+
   // 权限和沙箱配置
   const [showPermissionModal, setShowPermissionModal] = useState(false);
   const [selectedSkillPermissions, setSelectedSkillPermissions] = useState<{skillId: string, permissions: SkillPermission[]} | null>(null);
@@ -264,7 +283,8 @@ const SkillManager: React.FC = () => {
   const [editingTopic, setEditingTopic] = useState<any>(null);
   const [topicForm] = Form.useForm();
   const [topicFiles, setTopicFiles] = useState<Array<{file: File, addedAt: number}>>([]);
-  
+  const [topicWorkspaceScanningId, setTopicWorkspaceScanningId] = useState<string | null>(null);
+
   // 用户偏好建模相关状态
   const [profileStats, setProfileStats] = useState<any>(null);
   const [userTopSkills, setUserTopSkills] = useState<any[]>([]);
@@ -275,6 +295,10 @@ const SkillManager: React.FC = () => {
   const [evolutionStats, setEvolutionStats] = useState<any>(null);
   const [skillEvolutions, setSkillEvolutions] = useState<Record<string, any>>({});
   const [evolutionLoading, setEvolutionLoading] = useState(false);
+  const [abSkillId, setAbSkillId] = useState<string>('');
+  const [abForm] = Form.useForm();
+  const [abStats, setAbStats] = useState<Record<string, unknown> | null>(null);
+  const [abSaving, setAbSaving] = useState(false);
   
   const [prompts, setPrompts] = useState<any[]>([]);
   const [selectedPrompts, setSelectedPrompts] = useState<string[]>([]);
@@ -301,18 +325,19 @@ const SkillManager: React.FC = () => {
   const [yueliDebugEnabled, setYueliDebugEnabled] = useState(() => {
     return debugManager.isEnabledFlag();
   });
+  const [ollamaThinkEnabled, setOllamaThinkEnabled] = useState(() => readOllamaThinkModePreference());
   const [isMCPModalOpen, setIsMCPModalOpen] = useState(false);
   
   const [kgmSdkConfig, setKgmSdkConfig] = useState<any>({
     baseUrl: localStorage.getItem('kgmBaseUrl') || import.meta.env.VITE_KGM_BASE_URL || 'http://127.0.0.1:3080',
-    apiKey: localStorage.getItem('kgmApiKey') || '',
+    apiKey: getSecret('kgmApiKey'),
     timeout: parseInt(localStorage.getItem('kgmTimeout') || '60000'),
     ollamaBaseUrl: localStorage.getItem('kgmOllamaBaseUrl') || 'http://localhost:11434',
     scheduleStrategy: localStorage.getItem('kgmScheduleStrategy') || 'kgm-dynamic'
   });
   
   const [cloudInferenceConfig, setCloudInferenceConfig] = useState<any>({
-    cloudProviders: JSON.parse(localStorage.getItem('cloudProviders') || '[]')
+    cloudProviders: readCloudProvidersFromLocalStorage()
   });
 
   const [embeddingConfig, setEmbeddingConfig] = useState<any>({
@@ -322,7 +347,7 @@ const SkillManager: React.FC = () => {
     dimension: parseInt(localStorage.getItem('embeddingDimension') || '768'),
     batchSize: parseInt(localStorage.getItem('embeddingBatchSize') || '32'),
     timeout: parseInt(localStorage.getItem('embeddingTimeout') || '60'),
-    apiKey: localStorage.getItem('embeddingApiKey') || '',
+    apiKey: getSecret('embeddingApiKey'),
     format: localStorage.getItem('embeddingFormat') || 'ollama'
   });
 
@@ -468,6 +493,7 @@ const SkillManager: React.FC = () => {
     }
 
     // 获取项目主题（从 localStorage 同步）
+    clearLegacyWorkspaceLocalStorage();
     const savedTopics = localStorage.getItem('yueli_topics');
     if (savedTopics) {
       setTopics(JSON.parse(savedTopics));
@@ -573,6 +599,69 @@ const SkillManager: React.FC = () => {
     }
   };
 
+  const loadAbPanel = async (skillId: string) => {
+    setAbSkillId(skillId);
+    const exp = await fetchAbExperiment(skillId);
+    abForm.setFieldsValue({
+      enabled: exp?.enabled ?? false,
+      promptA: exp?.variants?.A?.systemPrompt ?? '',
+      promptB: exp?.variants?.B?.systemPrompt ?? ''
+    });
+    const stats = await fetchAbStats(skillId);
+    setAbStats(stats);
+  };
+
+  const saveAbPanel = async () => {
+    if (!abSkillId) {
+      toast.error('请先选择技能');
+      return;
+    }
+    const v = await abForm.validateFields();
+    setAbSaving(true);
+    const ok = await saveAbExperimentConfig({
+      skillId: abSkillId,
+      enabled: !!v.enabled,
+      variants: {
+        A: { label: 'A', systemPrompt: v.promptA || '' },
+        B: { label: 'B', systemPrompt: v.promptB || '' }
+      }
+    });
+    setAbSaving(false);
+    if (ok) {
+      toast.success('A/B 实验已保存');
+      const stats = await fetchAbStats(abSkillId);
+      setAbStats(stats);
+    } else {
+      toast.error('保存失败（请确认 Skill Executor 已启动）');
+    }
+  };
+
+  const renderEvolutionMetrics = (evo: Record<string, unknown>) => {
+    const schemaPct = ((Number(evo.schemaPassRate) || 0) * 100).toFixed(0);
+    const items: { label: string; value: string | number; color: string }[] = [
+      { label: '执行次数', value: Number(evo.totalExecutions) || 0, color: '#1890ff' },
+      { label: '成功率', value: `${((Number(evo.successRate) || 0) * 100).toFixed(0)}%`, color: '#52c41a' },
+      {
+        label: '平均耗时',
+        value: `${((Number(evo.avgExecutionMs) || Number(evo.avgDurationMs) || 0) / 1000).toFixed(1)}s`,
+        color: '#faad14'
+      },
+      { label: '注入 token', value: Math.round(Number(evo.avgTokensInjected) || 0), color: '#722ed1' },
+      { label: 'Schema 通过', value: `${schemaPct}%`, color: '#13c2c2' },
+      { label: 'Tool 轮次', value: (Number(evo.avgToolRoundCount) || 0).toFixed(1), color: '#eb2f96' }
+    ];
+    return (
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+        {items.map((it) => (
+          <div key={it.label} style={{ textAlign: 'center' }}>
+            <div style={{ fontSize: 14, fontWeight: 600, color: it.color }}>{it.value}</div>
+            <div style={{ fontSize: 10, color: '#666' }}>{it.label}</div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
   useEffect(() => {
     if (!orchestrator) return;
     
@@ -607,6 +696,12 @@ const SkillManager: React.FC = () => {
       cancelled = true;
       clearInterval(interval);
     };
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== 'evolution') return;
+    void fetchEvolutionStats();
+    void fetchSkillEvolutions();
   }, [activeTab]);
 
   // 拉取单条执行的完整日志（懒加载）
@@ -857,7 +952,7 @@ const SkillManager: React.FC = () => {
         setSkillTestResults(prev => ({ ...prev, [skill.id]: result }));
 
         if (result.success) {
-          console.log(`技能 "${skill.name}" 安装并测试成功`);
+          devLog(`技能 "${skill.name}" 安装并测试成功`);
         } else {
           console.error(`技能 "${skill.name}" 测试失败: ${result.message}`);
         }
@@ -970,8 +1065,8 @@ const SkillManager: React.FC = () => {
     };
 
     const callback: TaskCallback = {
-      onStart: (task, ctx) => console.log('任务开始:', task, ctx),
-      onComplete: (task, result) => console.log('任务完成:', result),
+      onStart: (task, ctx) => devLog('任务开始:', task, ctx),
+      onComplete: (task, result) => devLog('任务完成:', result),
       onError: (task, error) => console.error('任务错误:', error)
     };
 
@@ -1017,12 +1112,53 @@ const SkillManager: React.FC = () => {
     }
   };
 
+  const handlePickTopicWorkspaceDir = async () => {
+    const picked = await pickDirectoryViaDesktop();
+    if (picked) {
+      topicForm.setFieldValue('workspaceRoot', picked);
+      return;
+    }
+    toast('Web 端请直接输入本机目录绝对路径；桌面版可用「选择目录」', { icon: 'ℹ️' });
+  };
+
+  const handleScanTopicWorkspace = async (topic: { id: string; workspaceRoot?: string }) => {
+    if (!topic.workspaceRoot?.trim()) {
+      toast.error('请先配置本机工作区目录');
+      return;
+    }
+    setTopicWorkspaceScanningId(topic.id);
+    try {
+      const { topics: next, scan } = await scanAndPersistTopicWorkspace(topics, topic.id);
+      if (!scan.success) {
+        toast.error(scan.error || '索引失败');
+        return;
+      }
+      setTopics(next);
+      if (editingTopic?.id === topic.id) {
+        const refreshed = next.find((t) => t.id === topic.id);
+        if (refreshed) setEditingTopic(refreshed);
+      }
+      toast.success(`已索引 ${scan.indexedCount ?? 0} 个文件`);
+    } catch (e) {
+      console.error(e);
+      toast.error('索引本机目录失败');
+    } finally {
+      setTopicWorkspaceScanningId(null);
+    }
+  };
+
   // 项目主题操作
   const handleSaveTopic = (values: any) => {
+    const nextRoot = (values.workspaceRoot || '').trim() || undefined;
+    const rootChanged =
+      editingTopic && nextRoot !== (editingTopic.workspaceRoot || '').trim();
     const newTopic = {
       id: editingTopic?.id || `topic-${Date.now()}`,
       name: values.name,
       description: values.description || '',
+      workspaceRoot: nextRoot,
+      workspaceLastScanAt: rootChanged ? undefined : editingTopic?.workspaceLastScanAt,
+      workspaceIndexedCount: rootChanged ? undefined : editingTopic?.workspaceIndexedCount,
       files: topicFiles.length > 0 ? topicFiles.map(item => ({
         name: item.file.name,
         size: item.file.size,
@@ -1040,6 +1176,7 @@ const SkillManager: React.FC = () => {
     }
 
     setTopics(updatedTopics);
+    clearLegacyWorkspaceLocalStorage();
     persistTopicsForSkillManager(updatedTopics, (err: any) => {
       if (err?.name === 'QuotaExceededError' || /quota/i.test(String(err?.message || ''))) {
         toast.error('保存项目主题失败：浏览器存储已满，请删除无用主题后重试');
@@ -1071,7 +1208,8 @@ const SkillManager: React.FC = () => {
     setEditingTopic(topic);
     topicForm.setFieldsValue({
       name: topic.name,
-      description: topic.description
+      description: topic.description,
+      workspaceRoot: topic.workspaceRoot || ''
     });
     setTopicFiles([]);
     setShowTopicModal(true);
@@ -1122,17 +1260,25 @@ const SkillManager: React.FC = () => {
   // 创建集合
   const handleCreateCollection = (values: any) => {
     if (!collectionManager) return;
-    
+    const name = values.name?.trim();
+    if (!name) {
+      toast.error('请输入有效的集合名称');
+      return;
+    }
+
     const collection = collectionManager.createCollection(
-      values.name,
-      values.description,
-      { icon: values.icon, color: values.color }
+      name,
+      (values.description && String(values.description).trim()) || '',
+      {
+        icon: values.icon?.trim() || undefined,
+        color: values.color?.trim() || undefined
+      }
     );
-    
+
     setCollections(collectionManager.getAllCollections());
     setShowCreateCollection(false);
     collectionForm.resetFields();
-    toast.success('技能集合创建成功！');
+    toast.success(`技能集合「${collection.name}」已创建，可在上方「按集合筛选」中选择。`);
   };
 
   // 删除集合
@@ -1146,7 +1292,7 @@ const SkillManager: React.FC = () => {
         collectionManager.deleteCollection(collectionId);
         setCollections(collectionManager.getAllCollections());
         if (selectedCollection === collectionId) {
-          setSelectedCollection(null);
+          setSelectedCollection('');
         }
         toast.success('技能集合已删除');
       }
@@ -1182,46 +1328,19 @@ const SkillManager: React.FC = () => {
     });
   };
 
-  // 扫描本地技能
-  const handleScanLocalSkills = async () => {
+  /** 扫描本机主流工具技能目录（Cursor / Windsurf / Codex / Claude Code / OpenClaw 等，含 .agent、.skill 约定） */
+  const handleScanAllSkillDirectories = async () => {
     if (!localSkillScanner) return;
-    
+
     setScanningLocal(true);
     try {
       const sources = await localSkillScanner.scanAllDirectories();
       setLocalSkills(sources);
-      toast.success(`发现 ${sources.reduce((sum, source) => sum + source.skills.length, 0)} 个本地技能`);
+      const total = sources.reduce((sum, s) => sum + s.skills.length, 0);
+      toast.success(`扫描完成：${sources.length} 个目录来源，共 ${total} 个技能`);
     } catch (error) {
-      console.error('扫描本地技能失败:', error);
-      toast.error('扫描本地技能失败');
-    } finally {
-      setScanningLocal(false);
-    }
-  };
-
-  // 扫描当前工作区的 .skills 目录
-  const handleScanWorkspaceSkills = async () => {
-    if (!localSkillScanner) return;
-    
-    setScanningLocal(true);
-    try {
-      // 尝试通过服务器端扫描，使用当前工作目录
-      const skillsPath = '/Users/yr.z/work/yuelicopilot/.skills';
-      const source = await localSkillScanner.scanDirectoryViaServer(skillsPath, 'yueli');
-      
-      if (!source) {
-        toast.error('无法扫描工作区技能目录，请确认 Skill Executor 已启动');
-        return;
-      }
-
-      setLocalSkills(prev => {
-        const filtered = prev.filter(s => s.platform !== 'yueli');
-        return [...filtered, source];
-      });
-      toast.success(`在工作区发现 ${source.skills.length} 个技能`);
-    } catch (error) {
-      console.error('扫描工作区技能失败:', error);
-      toast.error('扫描工作区技能失败');
+      console.error('扫描技能目录失败:', error);
+      toast.error('扫描技能目录失败');
     } finally {
       setScanningLocal(false);
     }
@@ -1261,27 +1380,32 @@ const SkillManager: React.FC = () => {
   // 选择自定义目录扫描
   const handleSelectCustomDirectory = async () => {
     if (!localSkillScanner) return;
-    
+
     setScanningLocal(true);
     try {
-      // 让用户选择目录
-      const result = await localSkillScanner.showDirectoryPicker();
-      if (!result) {
-        toast.error('您的浏览器不支持目录选择，请使用 Chrome/Edge 等支持 File System Access API 的浏览器');
+      const picked = await localSkillScanner.pickSkillRootDirectory();
+      if (!picked.ok) {
         return;
       }
-      
-      const { handle, name: directoryName } = result;
-      
-      // 扫描选择的目录
-      const source = await localSkillScanner.scanCustomDirectory(handle, directoryName);
-      
+
+      const source =
+        picked.mode === 'fs'
+          ? await localSkillScanner.scanCustomDirectory(picked.handle, picked.name)
+          : await localSkillScanner.scanCustomDirectoryFromWebkitFiles(picked.files, picked.name);
+
       // 将新发现的技能添加到现有列表
       setLocalSkills(prev => {
         const filtered = prev.filter(s => s.platform !== 'custom');
         return [...filtered, source];
       });
-      
+
+      if (source.skills.length === 0) {
+        toast.error(
+          '未在所选文件夹中识别到技能清单（需包含 skill.json / manifest.json / SKILL.md 等）。请确认选中了技能包根目录或各技能子目录。'
+        );
+        return;
+      }
+
       toast.success(`发现 ${source.skills.length} 个本地技能`);
     } catch (error) {
       console.error('选择目录扫描失败:', error);
@@ -1456,6 +1580,8 @@ const SkillManager: React.FC = () => {
       'database': '数据库操作',
       'file': '文件处理',
       'web': '网页与API',
+      'research': '联网研究',
+      'knowledge': '桌面知识',
       'productivity': '生产力工具',
       'system': '系统约束',
       'other': '其他'
@@ -1473,6 +1599,8 @@ const SkillManager: React.FC = () => {
       'database': '🗄️',
       'file': '📁',
       'web': '🌐',
+      'research': '🔍',
+      'knowledge': '📚',
       'productivity': '⚡',
       'system': '🔒',
       'other': '📦'
@@ -1484,6 +1612,7 @@ const SkillManager: React.FC = () => {
   const getPermissionDescription = (permission: SkillPermission) => {
     const descriptions: Record<SkillPermission, string> = {
       'file.read': '读取文件',
+      'filesystem.read': '读取本机目录（工作区扫描）',
       'file.write': '写入文件',
       'file.delete': '删除文件',
       'network.http': '发送HTTP请求',
@@ -1504,6 +1633,7 @@ const SkillManager: React.FC = () => {
       'localStorage.access': '低',
       'notification.send': '低',
       'file.read': '中',
+      'filesystem.read': '中',
       'file.write': '中',
       'environment.read': '中',
       'clipboard.read': '中',
@@ -1669,7 +1799,7 @@ const SkillManager: React.FC = () => {
   const loadPromptRegistry = async () => {
     try {
       setPromptRegistryLoading(true);
-      await promptRegistry.load();
+      await promptRegistry.ensureHydrated();
       const allPrompts = promptRegistry.getAll();
       setPromptRegistryTemplates(allPrompts);
     } catch (error) {
@@ -1977,7 +2107,9 @@ const SkillManager: React.FC = () => {
             importedCount++;
           }
           if (data.sessionMessages) {
-            localStorage.setItem('yueli_session_messages', JSON.stringify(data.sessionMessages));
+            const { store: cleaned } = migrateSessionMessagesStore(data.sessionMessages);
+            localStorage.setItem('yueli_session_messages', JSON.stringify(cleaned));
+            localStorage.setItem('yueli_session_messages_markdown_v1', '1');
             importedCount++;
           }
           if (data.topics) {
@@ -2213,7 +2345,7 @@ const SkillManager: React.FC = () => {
       format: 'openai'
     },
     'together': {
-      endpoint: 'https://api.together.xyz/v1/embeddings',
+      endpoint: 'https://api.together.ai/v1/embeddings',
       model: 'togethercomputer/m2-bert-80M-8k-retrieval',
       dimension: 768,
       batchSize: 32,
@@ -2242,7 +2374,7 @@ const SkillManager: React.FC = () => {
     localStorage.setItem('embeddingDimension', embeddingConfig.dimension.toString());
     localStorage.setItem('embeddingBatchSize', embeddingConfig.batchSize.toString());
     localStorage.setItem('embeddingTimeout', embeddingConfig.timeout.toString());
-    localStorage.setItem('embeddingApiKey', embeddingConfig.apiKey);
+    setSecret('embeddingApiKey', embeddingConfig.apiKey || '');
     localStorage.setItem('embeddingFormat', embeddingConfig.format);
     apiService.setEmbeddingConfig(embeddingConfig);
     toast.success('向量引擎配置保存成功');
@@ -2367,28 +2499,9 @@ const SkillManager: React.FC = () => {
         {isSkill && skillEvolutions[plugin.id] && (
           <div style={{ marginTop: 12, padding: '8px 12px', background: '#f5f7fa', borderRadius: 6 }}>
             <div style={{ fontSize: 12, fontWeight: 600, color: '#333', marginBottom: 8 }}>
-              <ThunderboltOutlined /> 自进化数据
+              <ThunderboltOutlined /> 可观测性 / 自进化
             </div>
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 14, fontWeight: 600, color: '#1890ff' }}>
-                  {skillEvolutions[plugin.id].totalExecutions || 0}
-                </div>
-                <div style={{ fontSize: 10, color: '#666' }}>执行次数</div>
-              </div>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 14, fontWeight: 600, color: '#52c41a' }}>
-                  {((skillEvolutions[plugin.id].successRate || 0) * 100).toFixed(0)}%
-                </div>
-                <div style={{ fontSize: 10, color: '#666' }}>成功率</div>
-              </div>
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 14, fontWeight: 600, color: '#faad14' }}>
-                  {(skillEvolutions[plugin.id].avgDurationMs || 0) / 1000}s
-                </div>
-                <div style={{ fontSize: 10, color: '#666' }}>平均耗时</div>
-              </div>
-            </div>
+            {renderEvolutionMetrics(skillEvolutions[plugin.id])}
           </div>
         )}
         {testResult?.errors && testResult.errors.length > 0 && (
@@ -2604,6 +2717,29 @@ const SkillManager: React.FC = () => {
             value={profileLoading ? '...' : (profileStats?.totalInteractions || 0)}
             valueStyle={{ color: '#eb2f96' }}
           />
+          {evolutionStats && (
+            <>
+              <Statistic
+                title={<span style={{ color: '#666' }}>技能执行</span>}
+                value={evolutionLoading ? '...' : evolutionStats.totalExecutions || 0}
+                valueStyle={{ color: '#1890ff' }}
+              />
+              <Statistic
+                title={<span style={{ color: '#666' }}>均注入 token</span>}
+                value={evolutionLoading ? '...' : evolutionStats.avgTokensInjected || 0}
+                valueStyle={{ color: '#722ed1' }}
+              />
+              <Statistic
+                title={<span style={{ color: '#666' }}>Schema 通过率</span>}
+                value={
+                  evolutionLoading
+                    ? '...'
+                    : `${((evolutionStats.avgSchemaPassRate || 0) * 100).toFixed(0)}%`
+                }
+                valueStyle={{ color: '#13c2c2' }}
+              />
+            </>
+          )}
         </StatsContainer>
       </Header>
 
@@ -2616,23 +2752,25 @@ const SkillManager: React.FC = () => {
         justifyContent: 'space-between',
         alignItems: 'center'
       }}>
-        <Tabs 
-          activeKey={activeTab} 
+        <Tabs
+          activeKey={activeTab}
           onChange={setActiveTab}
           type="card"
           style={{ flex: 1 }}
-        >
-          <Tabs.TabPane key="plugins" tab={<span><AppstoreOutlined /> 技能管理</span>} />
-          <Tabs.TabPane key="tasks" tab={<span><ClockCircleOutlined /> 任务管理</span>} />
-          <Tabs.TabPane key="audit" tab={<span><AuditOutlined /> 审计日志</span>} />
-          <Tabs.TabPane key="sandbox" tab={<span><FolderOpenOutlined /> Sandbox 浏览器</span>} />
-          <Tabs.TabPane key="knowledge" tab={<span><DatabaseOutlined /> 项目主题知识库</span>} />
-          <Tabs.TabPane key="prompts" tab={<span><ThunderboltOutlined /> 快速提示</span>} />
-          <Tabs.TabPane key="prompt-registry" tab={<span><InfoCircleOutlined /> Prompt管理</span>} />
-          <Tabs.TabPane key="mcp" tab={<span><DatabaseOutlined /> MCP 连接器</span>} />
-          <Tabs.TabPane key="config" tab={<span><SettingOutlined /> 配置管理</span>} />
-          <Tabs.TabPane key="yueli-copilot" tab={<span><InfoCircleOutlined /> YueliCopilot 设置</span>} />
-        </Tabs>
+          items={[
+            { key: 'plugins', label: <span><AppstoreOutlined /> 技能管理</span> },
+            { key: 'evolution', label: <span><ThunderboltOutlined /> 进化 / A/B</span> },
+            { key: 'tasks', label: <span><ClockCircleOutlined /> 任务管理</span> },
+            { key: 'audit', label: <span><AuditOutlined /> 审计日志</span> },
+            { key: 'sandbox', label: <span><FolderOpenOutlined /> Sandbox 浏览器</span> },
+            { key: 'knowledge', label: <span><DatabaseOutlined /> 项目主题知识库</span> },
+            { key: 'prompts', label: <span><ThunderboltOutlined /> 快速提示</span> },
+            { key: 'prompt-registry', label: <span><InfoCircleOutlined /> Prompt管理</span> },
+            { key: 'mcp', label: <span><DatabaseOutlined /> MCP 连接器</span> },
+            { key: 'config', label: <span><SettingOutlined /> 配置管理</span> },
+            { key: 'yueli-copilot', label: <span><InfoCircleOutlined /> YueliCopilot 设置</span> }
+          ]}
+        />
         
         {/* 全局导入导出按钮 */}
         <Space style={{ marginLeft: 16 }}>
@@ -2689,7 +2827,7 @@ const SkillManager: React.FC = () => {
                   style={{ width: 160 }}
                   placeholder="按集合筛选"
                 >
-                  <Option value={null}>全部集合</Option>
+                  <Option value="">全部集合</Option>
                   {collections.map(collection => (
                     <Option key={collection.id} value={collection.id}>
                       {collection.name}
@@ -2697,18 +2835,15 @@ const SkillManager: React.FC = () => {
                   ))}
                 </Select>
               </Space>
-              <Space>
-                <Button icon={<AppstoreOutlined />} onClick={handleScanWorkspaceSkills} loading={scanningLocal}>
-                  扫描工作区技能
-                </Button>
-                <Button icon={<ScanOutlined />} onClick={handleScanLocalSkills} loading={scanningLocal}>
-                  扫描本地技能
+              <Space wrap align="center">
+                <Button icon={<ScanOutlined />} onClick={handleScanAllSkillDirectories} loading={scanningLocal}>
+                  扫描技能目录
                 </Button>
                 <Button icon={<FolderOpenOutlined />} onClick={handleSelectCustomDirectory}>
                   选择目录扫描
                 </Button>
                 <Button icon={<FolderOpenOutlined />} onClick={() => setShowCreateCollection(true)}>
-                  技能集合
+                  新建技能集合
                 </Button>
                 <Button type="primary" icon={<PlusOutlined />} onClick={() => setShowInstallModal(true)}>
                   安装技能
@@ -2718,9 +2853,9 @@ const SkillManager: React.FC = () => {
             
             {/* 用户偏好统计卡片 */}
             <div style={{ marginBottom: 24 }}>
-              <Card 
-                title={<span><ThunderboltOutlined /> 用户偏好分析</span>} 
-                bordered={false}
+              <Card
+                title={<span><ThunderboltOutlined /> 用户偏好分析</span>}
+                variant="borderless"
                 style={{ boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}
               >
                 <div style={{ display: 'flex', gap: 24 }}>
@@ -2813,6 +2948,131 @@ const SkillManager: React.FC = () => {
                   )}
                 </CardGrid>
               </div>
+            )}
+          </div>
+        )}
+
+        {activeTab === 'evolution' && (
+          <div style={{ background: '#fff', borderRadius: 8, padding: 24, boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
+            <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span style={{ fontWeight: 600 }}>可观测性汇总</span>
+              <Button
+                icon={<ReloadOutlined />}
+                loading={evolutionLoading}
+                onClick={async () => {
+                  await fetchEvolutionStats();
+                  await fetchSkillEvolutions();
+                }}
+              >
+                刷新
+              </Button>
+            </div>
+            {evolutionStats ? (
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 24 }}>
+                <Card size="small">
+                  <Statistic title="总执行" value={evolutionStats.totalExecutions} />
+                </Card>
+                <Card size="small">
+                  <Statistic
+                    title="平均成功率"
+                    value={`${((evolutionStats.avgSuccessRate || 0) * 100).toFixed(0)}%`}
+                  />
+                </Card>
+                <Card size="small">
+                  <Statistic title="均注入 token" value={evolutionStats.avgTokensInjected || 0} />
+                </Card>
+                <Card size="small">
+                  <Statistic
+                    title="Registry 后端"
+                    value={evolutionStats.registryBackend || 'memory'}
+                  />
+                </Card>
+              </div>
+            ) : (
+              <Empty description="无法连接 Skill Executor 或暂无进化数据" />
+            )}
+
+            <Table
+              size="small"
+              rowKey="skillId"
+              pagination={{ pageSize: 8 }}
+              dataSource={Object.values(skillEvolutions)}
+              columns={[
+                { title: '技能', dataIndex: 'skillId', width: 180 },
+                { title: '执行', dataIndex: 'totalExecutions', width: 80 },
+                {
+                  title: '成功率',
+                  width: 80,
+                  render: (_, r) => `${((r.successRate || 0) * 100).toFixed(0)}%`
+                },
+                {
+                  title: '耗时(s)',
+                  width: 80,
+                  render: (_, r) => ((r.avgExecutionMs || r.avgDurationMs || 0) / 1000).toFixed(1)
+                },
+                {
+                  title: 'Token',
+                  width: 80,
+                  render: (_, r) => Math.round(r.avgTokensInjected || 0)
+                },
+                {
+                  title: 'Schema',
+                  width: 80,
+                  render: (_, r) => `${((r.schemaPassRate || 0) * 100).toFixed(0)}%`
+                },
+                {
+                  title: 'Tool 轮',
+                  width: 80,
+                  render: (_, r) => (r.avgToolRoundCount || 0).toFixed(1)
+                },
+                {
+                  title: 'A/B',
+                  width: 100,
+                  render: (_, r) => (
+                    <Button type="link" size="small" onClick={() => loadAbPanel(r.skillId)}>
+                      配置
+                    </Button>
+                  )
+                }
+              ]}
+            />
+
+            <Divider />
+            <h4 style={{ fontWeight: 600 }}>Prompt A/B 实验</h4>
+            <Form form={abForm} layout="vertical" style={{ maxWidth: 720 }}>
+              <Form.Item label="目标技能 ID">
+                <Select
+                  showSearch
+                  placeholder="选择技能"
+                  value={abSkillId || undefined}
+                  onChange={(id) => loadAbPanel(id)}
+                  options={plugins
+                    .filter((p) => p.type === 'skill')
+                    .map((p) => ({ label: p.name || p.id, value: p.id }))}
+                />
+              </Form.Item>
+              <Form.Item name="enabled" label="启用实验" valuePropName="checked">
+                <Switch />
+              </Form.Item>
+              <Form.Item name="promptA" label="变体 A（追加到 system prompt）">
+                <Input.TextArea rows={4} placeholder="A 组注入文案" />
+              </Form.Item>
+              <Form.Item name="promptB" label="变体 B">
+                <Input.TextArea rows={4} placeholder="B 组注入文案" />
+              </Form.Item>
+              <Button type="primary" loading={abSaving} onClick={saveAbPanel}>
+                保存实验
+              </Button>
+            </Form>
+            {abStats && (
+              <Card size="small" style={{ marginTop: 16 }} title="分桶统计">
+                <pre style={{ margin: 0, fontSize: 12 }}>{JSON.stringify(abStats.buckets, null, 2)}</pre>
+                {abStats.leader != null && (
+                  <div style={{ marginTop: 8 }}>
+                    领先变体：<Tag color="green">{String(abStats.leader)}</Tag>
+                  </div>
+                )}
+              </Card>
             )}
           </div>
         )}
@@ -3335,6 +3595,15 @@ const SkillManager: React.FC = () => {
                           size="small"
                           hoverable
                           actions={[
+                            <Tooltip title="索引本机目录">
+                              <Button
+                                type="text"
+                                icon={<ScanOutlined />}
+                                loading={topicWorkspaceScanningId === topic.id}
+                                disabled={!topic.workspaceRoot?.trim()}
+                                onClick={() => handleScanTopicWorkspace(topic)}
+                              />
+                            </Tooltip>,
                             <Tooltip title="编辑">
                               <Button
                                 type="text"
@@ -3357,9 +3626,29 @@ const SkillManager: React.FC = () => {
                               {topic.name}
                             </div>
                             <div style={{ fontSize: 12, color: '#888' }}>
-                              {topic.files?.length || 0} 个文件
+                              {topic.files?.length || 0} 个手动附加文件
+                              {topic.workspaceRoot
+                                ? ` · 本机目录已配置${
+                                    topic.workspaceIndexedCount != null
+                                      ? `（已索引 ${topic.workspaceIndexedCount}）`
+                                      : '（未索引）'
+                                  }`
+                                : ''}
                             </div>
                           </div>
+                          {topic.workspaceRoot && (
+                            <div
+                              style={{
+                                fontSize: 11,
+                                color: '#999',
+                                marginBottom: 8,
+                                wordBreak: 'break-all'
+                              }}
+                              title={topic.workspaceRoot}
+                            >
+                              📁 {topic.workspaceRoot}
+                            </div>
+                          )}
                           {topic.description && (
                             <p style={{ fontSize: 13, color: '#666', margin: 0, marginBottom: 8 }}>
                               {topic.description}
@@ -3812,7 +4101,7 @@ const SkillManager: React.FC = () => {
         {/* 配置管理 */}
         {activeTab === 'config' && (
           <div style={{ background: '#fff', borderRadius: '8px', padding: '24px', boxShadow: '0 2px 8px rgba(0,0,0,0.06)' }}>
-            <Card>
+            <Card styles={{ body: { maxHeight: 'calc(100vh - 180px)', overflowY: 'auto' } }}>
               <div style={{ borderBottom: '1px solid #e0e0e0', marginBottom: 20, display: 'flex' }}>
                 <button 
                   style={{
@@ -3887,11 +4176,14 @@ const SkillManager: React.FC = () => {
                   initialValues={kgmSdkConfig}
                   onFinish={(values) => {
                     localStorage.setItem('kgmBaseUrl', values.baseUrl);
-                    localStorage.setItem('kgmApiKey', values.apiKey || '');
+                    setSecret('kgmApiKey', values.apiKey || '');
                     localStorage.setItem('kgmTimeout', values.timeout.toString());
                     localStorage.setItem('kgmOllamaBaseUrl', values.ollamaBaseUrl || '');
                     localStorage.setItem('kgmScheduleStrategy', values.scheduleStrategy);
                     setKgmSdkConfig(values);
+                    if (typeof window !== 'undefined') {
+                      window.dispatchEvent(new Event('yueli-cloud-providers-changed'));
+                    }
                     toast.success('Yueli-KGM-Computing SDK配置保存成功');
                   }}
                 >
@@ -3979,161 +4271,32 @@ const SkillManager: React.FC = () => {
               
               {activeConfigTab === 'cloud-inference' && (
                 <div>
-                  <div style={{ marginBottom: '16px' }}>
-                    <button
-                      type="button"
-                      style={{
-                        padding: '8px 16px',
-                        background: '#1890ff',
-                        color: '#fff',
-                        border: 'none',
-                        borderRadius: '4px',
-                        cursor: 'pointer',
-                        fontSize: '14px'
-                      }}
-                      onClick={() => {
-                        setCloudInferenceConfig((prev: any) => ({
-                          ...prev,
-                          cloudProviders: [...prev.cloudProviders, {
-                            id: `provider_${Date.now()}`,
-                            name: '新服务商',
-                            apiUrl: '',
-                            apiKey: '',
-                            model: '',
-                            enabled: false
-                          }]
-                        }));
-                      }}
-                    >
-                      添加服务商
-                    </button>
-                  </div>
-                  {cloudInferenceConfig.cloudProviders.map((provider: any, index: number) => (
-                    <form key={provider.id} style={{
-                      border: '1px solid #e0e0e0',
-                      borderRadius: '8px',
-                      padding: '16px',
-                      marginBottom: '12px',
-                      background: '#fafafa'
-                    }}>
-                      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
-                        <input
-                          type="text"
-                          value={provider.name}
-                          onChange={(e) => {
-                            const updatedProviders = [...cloudInferenceConfig.cloudProviders];
-                            updatedProviders[index].name = e.target.value;
-                            setCloudInferenceConfig((prev: any) => ({ ...prev, cloudProviders: updatedProviders }));
-                          }}
-                          style={{
-                            padding: '8px 12px',
-                            border: '1px solid #d9d9d9',
-                            borderRadius: '4px',
-                            fontSize: '14px',
-                            width: '200px'
-                          }}
-                          placeholder="服务商名称"
-                        />
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-                          <label style={{ fontSize: '14px', display: 'flex', alignItems: 'center' }}>
-                            <input
-                              type="checkbox"
-                              checked={provider.enabled}
-                              onChange={(e) => {
-                                const updatedProviders = [...cloudInferenceConfig.cloudProviders];
-                                updatedProviders[index].enabled = e.target.checked;
-                                setCloudInferenceConfig((prev: any) => ({ ...prev, cloudProviders: updatedProviders }));
-                              }}
-                            />
-                            启用
-                          </label>
-                          <button
-                            type="button"
-                            style={{
-                              padding: '6px 12px',
-                              background: '#ff4d4f',
-                              color: '#fff',
-                              border: 'none',
-                              borderRadius: '4px',
-                              cursor: 'pointer',
-                              fontSize: '12px'
-                            }}
-                            onClick={() => {
-                              const updatedProviders = cloudInferenceConfig.cloudProviders.filter((p: any) => p.id !== provider.id);
-                              setCloudInferenceConfig((prev: any) => ({ ...prev, cloudProviders: updatedProviders }));
-                            }}
-                          >
-                            删除
-                          </button>
-                        </div>
-                      </div>
-                      <div style={{ marginBottom: '12px' }}>
-                        <label style={{ fontSize: '14px', display: 'block', marginBottom: '6px' }}>API地址</label>
-                        <input
-                          type="text"
-                          value={provider.apiUrl}
-                          onChange={(e) => {
-                            const updatedProviders = [...cloudInferenceConfig.cloudProviders];
-                            updatedProviders[index].apiUrl = e.target.value;
-                            setCloudInferenceConfig((prev: any) => ({ ...prev, cloudProviders: updatedProviders }));
-                          }}
-                          style={{
-                            padding: '8px 12px',
-                            border: '1px solid #d9d9d9',
-                            borderRadius: '4px',
-                            fontSize: '14px',
-                            width: '100%'
-                          }}
-                          placeholder="https://api.example.com/v1/chat/completions"
-                        />
-                      </div>
-                      <div style={{ marginBottom: '12px' }}>
-                        <label style={{ fontSize: '14px', display: 'block', marginBottom: '6px' }}>API Key</label>
-                        <input
-                          type="password"
-                          value={provider.apiKey}
-                          onChange={(e) => {
-                            const updatedProviders = [...cloudInferenceConfig.cloudProviders];
-                            updatedProviders[index].apiKey = e.target.value;
-                            setCloudInferenceConfig((prev: any) => ({ ...prev, cloudProviders: updatedProviders }));
-                          }}
-                          style={{
-                            padding: '8px 12px',
-                            border: '1px solid #d9d9d9',
-                            borderRadius: '4px',
-                            fontSize: '14px',
-                            width: '100%'
-                          }}
-                          placeholder="输入API Key"
-                        />
-                      </div>
-                      <div style={{ marginBottom: '12px' }}>
-                        <label style={{ fontSize: '14px', display: 'block', marginBottom: '6px' }}>模型版本</label>
-                        <input
-                          type="text"
-                          value={provider.model || ''}
-                          onChange={(e) => {
-                            const updatedProviders = [...cloudInferenceConfig.cloudProviders];
-                            updatedProviders[index].model = e.target.value;
-                            setCloudInferenceConfig((prev: any) => ({ ...prev, cloudProviders: updatedProviders }));
-                          }}
-                          style={{
-                            padding: '8px 12px',
-                            border: '1px solid #d9d9d9',
-                            borderRadius: '4px',
-                            fontSize: '14px',
-                            width: '100%'
-                          }}
-                          placeholder="如：gpt-4o-mini"
-                        />
-                      </div>
-                    </form>
-                  ))}
-                  <Button 
-                    type="primary" 
+                  <CloudProvidersConfigPanel
+                    variant="manager"
+                    rows={cloudInferenceConfig.cloudProviders}
+                    onChange={(cloudProviders) =>
+                      setCloudInferenceConfig((prev: any) => ({
+                        ...prev,
+                        cloudProviders: normalizeCloudProvidersModelsForStorage(cloudProviders)
+                      }))
+                    }
+                  />
+                  <Button
+                    type="primary"
                     onClick={() => {
-                      localStorage.setItem('cloudProviders', JSON.stringify(cloudInferenceConfig.cloudProviders));
-                      toast.success('云端推理配置保存成功');
+                      void (async () => {
+                        const rows = normalizeCloudProvidersModelsForStorage(
+                          cloudInferenceConfig.cloudProviders
+                        ) as CloudProviderRow[];
+                        const sync = await saveCloudProvidersWithKgmSync(rows);
+                        if (!sync.ok) {
+                          toast.error(sync.error || '同步 KGM 失败，请检查 Playground routes');
+                          return;
+                        }
+                        toast.success(
+                          `云端推理配置已保存${sync.verifyDetail ? `（${sync.verifyDetail}）` : ''}`
+                        );
+                      })();
                     }}
                   >
                     保存配置
@@ -4359,9 +4522,6 @@ const SkillManager: React.FC = () => {
                     <div style={{ fontWeight: 600, fontSize: '14px', color: '#333', marginBottom: '4px' }}>
                       Debug 模式
                     </div>
-                    <div style={{ fontSize: '12px', color: '#666' }}>
-                      开启后显示调试面板，记录请求和响应信息
-                    </div>
                   </div>
                   <label style={{ position: 'relative', display: 'inline-block', width: '44px', height: '24px' }}>
                     <input
@@ -4399,13 +4559,72 @@ const SkillManager: React.FC = () => {
                     </span>
                   </label>
                 </div>
-                <div style={{ fontSize: '11px', color: '#999' }}>
-                  调试面板 URL：{window.location.origin}?debug=true
+              </div>
+
+              <div style={{ padding: '16px', border: '1px solid #e0e0e0', borderRadius: '8px', background: '#f8f9fa' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                  <div>
+                    <div style={{ fontWeight: 600, fontSize: '14px', color: '#333', marginBottom: '4px' }}>
+                      Ollama thinking 模式
+                    </div>
+                    <div style={{ fontSize: '12px', color: '#666' }}>Ollama 直连时生效</div>
+                  </div>
+                  <Switch
+                    checked={ollamaThinkEnabled}
+                    onChange={(checked) => {
+                      localStorage.setItem('yueli_ollama_think', checked ? '1' : '0');
+                      setOllamaThinkEnabled(checked);
+                      toast.success('已保存 Ollama thinking 偏好');
+                    }}
+                  />
                 </div>
               </div>
             </Card>
           </div>
         )}
+
+      {/* 新建技能集合 */}
+      <Modal
+        title="新建技能集合"
+        open={showCreateCollection}
+        okText="创建"
+        cancelText="取消"
+        onCancel={() => {
+          setShowCreateCollection(false);
+          collectionForm.resetFields();
+        }}
+        onOk={async () => {
+          try {
+            const values = await collectionForm.validateFields();
+            handleCreateCollection(values);
+          } catch {
+            return Promise.reject();
+          }
+        }}
+        destroyOnHidden
+      >
+        <Form form={collectionForm} layout="vertical">
+          <Form.Item
+            name="name"
+            label="名称"
+            rules={[
+              { required: true, message: '请输入集合名称' },
+              { whitespace: true, message: '名称不能只包含空格' }
+            ]}
+          >
+            <Input placeholder="例如：前端常用" maxLength={64} showCount />
+          </Form.Item>
+          <Form.Item name="description" label="描述">
+            <TextArea placeholder="可选：说明该集合的用途" rows={3} maxLength={500} showCount />
+          </Form.Item>
+          <Form.Item name="icon" label="图标（可选）">
+            <Input placeholder="例如 emoji 或图标名" maxLength={32} />
+          </Form.Item>
+          <Form.Item name="color" label="主题色（可选）">
+            <Input placeholder="例如 #722ed1" maxLength={32} />
+          </Form.Item>
+        </Form>
+      </Modal>
 
       {/* 安装插件模态框 */}
       <Modal
@@ -4653,6 +4872,33 @@ const SkillManager: React.FC = () => {
           <Form.Item label="主题描述" name="description">
             <Input.TextArea placeholder="输入主题描述" />
           </Form.Item>
+
+          <Form.Item
+            label="本机工作区目录"
+            name="workspaceRoot"
+            extra="扫描该目录下的 md/pdf/docx/csv 等并入库；workspace_id 与主题 ID 相同，无需单独配置。"
+          >
+            <Input
+              placeholder="/Users/you/project 或桌面版点击选择目录"
+              addonAfter={
+                <Button type="link" size="small" icon={<FolderOpenOutlined />} onClick={handlePickTopicWorkspaceDir}>
+                  选择目录
+                </Button>
+              }
+            />
+          </Form.Item>
+
+          {editingTopic?.workspaceRoot?.trim() && (
+            <Form.Item>
+              <Button
+                icon={<ScanOutlined />}
+                loading={topicWorkspaceScanningId === editingTopic.id}
+                onClick={() => handleScanTopicWorkspace(editingTopic)}
+              >
+                索引本机目录
+              </Button>
+            </Form.Item>
+          )}
           
           <Form.Item label="添加文件">
             <Button type="primary" icon={<PlusOutlined />} onClick={() => {

@@ -13,6 +13,9 @@ import {
   resolveEnabledToolsetLogicalNames
 } from '../services/chat/ToolsetToolFilter';
 import { readKnowledgeScopeMode } from '../services/chat/KnowledgeScope';
+import { devLog, devWarn } from '../utils/devConsole';
+import { chunkText } from '../utils/chunkText';
+import type { PdfAttachmentContext } from '../services/documents/pdfOrchestratorIntegration';
 
 export interface KnowledgeItem {
   id: string;
@@ -43,6 +46,10 @@ interface ChatContextType {
       tools?: ToolDefinition[];
       toolCallHandler?: ToolCallHandler;
       enabledSkillIds?: string[];
+      kgmRequestHints?: {
+        compactAttachmentChat?: boolean;
+        suppressBlockingFallback?: boolean;
+      };
     }
   ) => Promise<
     | undefined
@@ -61,7 +68,8 @@ interface ChatContextType {
     selectedSkills?: string[],
     selectedConnectors?: any[],
     selectedTemplate?: string,
-    onStage?: (evt: { runId: string; stage: string; at: number; message?: string }) => void
+    onStage?: (evt: { runId: string; stage: string; at: number; message?: string }) => void,
+    extraOptions?: { pdfAttachmentContext?: PdfAttachmentContext; userId?: string }
   ) => Promise<{
     enhancedPrompt?: string;
     connectorData?: Record<string, any>;
@@ -72,6 +80,9 @@ interface ChatContextType {
     ragContext?: string;
     /** 检测到的技能安装请求 */
     skillInstallRequests?: SkillInstallRequest[];
+    /** context_injection：仅应暴露为 LLM tools 的技能 id */
+    toolEligibleSkillIds?: string[];
+    skillResults?: Record<string, { success?: boolean; result?: string }>;
   }>;
   /** 分析输入中的技能 URL */
   analyzeSkillUrls: (input: string) => Promise<SkillInstallRequest[]>;
@@ -104,7 +115,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   // Initialize MCP runtime
   useEffect(() => {
     const runtime = getMCPRuntime();
-    runtime.connectAll().catch(e => console.warn('MCP runtime init:', e));
+    runtime.connectAll().catch(e => devWarn('MCP runtime init:', e));
   }, []);
 
   const addMessage = useCallback((message: Message) => {
@@ -114,19 +125,6 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const clearMessages = useCallback(() => setMessages([]), []);
 
   /**
-   * 将文本按固定大小分块，相邻块有重叠以保留上下文
-   */
-  const chunkText = (text: string, chunkSize = 800, overlap = 100): string[] => {
-    const chunks: string[] = [];
-    let start = 0;
-    while (start < text.length) {
-      chunks.push(text.slice(start, start + chunkSize));
-      start += chunkSize - overlap;
-    }
-    return chunks.filter(c => c.trim().length > 20);
-  };
-
-  /**
    * 将知识库内容写入 KGM 向量索引
    * 分块后逐块调用 POST /v1/kgm/memory
    * 如果 KGM embedding 未配置，静默跳过（内容仍保留在 state 供全量注入）
@@ -134,7 +132,7 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const indexKnowledgeItem = useCallback(async (item: KnowledgeItem): Promise<KnowledgeItem> => {
     if (!item.content || item.content.trim().length === 0) return item;
 
-    const chunks = chunkText(item.content);
+    const chunks = chunkText(item.content).filter((c) => c.trim().length > 20);
     let successCount = 0;
 
     for (let i = 0; i < chunks.length; i++) {
@@ -208,6 +206,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       tools?: ToolDefinition[];
       toolCallHandler?: ToolCallHandler;
       enabledSkillIds?: string[];
+      kgmRequestHints?: {
+        compactAttachmentChat?: boolean;
+        suppressBlockingFallback?: boolean;
+      };
     }
   ) => {
     let tools = options?.tools;
@@ -220,16 +222,19 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       toolsetAllowlist = null;
     }
 
-    // 与 Plugin「启用」对齐：未显式传 tools 时按 resolveToolSkillIds 构建
+    // 仅当用户显式启用技能时才附带 tools；否则会把全部已启用插件的 schema 塞进 KGM，导致极慢或空回复
     if (!tools) {
-      const skillExecutor = orchestratorRef.current.getSkillExecutor();
-      let ids = orchestratorRef.current.resolveToolSkillIds(options?.enabledSkillIds);
-      if (toolsetAllowlist && toolsetAllowlist.size > 0) {
-        ids = filterSkillIdsByToolsetAllowlist(ids, toolsetAllowlist, skillExecutor);
-      }
-      tools = skillExecutor.getAllToolDefinitions(ids) as ToolDefinition[];
-      if (toolsetAllowlist && toolsetAllowlist.size > 0) {
-        tools = filterToolDefinitionsByAllowlist(tools, toolsetAllowlist);
+      const explicitSkillIds = (options?.enabledSkillIds || []).filter(Boolean);
+      if (explicitSkillIds.length > 0) {
+        const skillExecutor = orchestratorRef.current.getSkillExecutor();
+        let ids = orchestratorRef.current.resolveToolSkillIds(explicitSkillIds);
+        if (toolsetAllowlist && toolsetAllowlist.size > 0) {
+          ids = filterSkillIdsByToolsetAllowlist(ids, toolsetAllowlist, skillExecutor);
+        }
+        tools = skillExecutor.getAllToolDefinitions(ids) as ToolDefinition[];
+        if (toolsetAllowlist && toolsetAllowlist.size > 0) {
+          tools = filterToolDefinitionsByAllowlist(tools, toolsetAllowlist);
+        }
       }
     }
 
@@ -241,7 +246,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     return await apiService.sendOllamaMessageWithMessages(model, msgs, onData, {
       tools,
-      toolCallHandler
+      toolCallHandler,
+      kgmRequestHints: options?.kgmRequestHints
     });
   }, []);
 
@@ -250,7 +256,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
     selectedSkills?: string[],
     selectedConnectors?: any[],
     selectedTemplate?: string,
-    onStage?: (evt: { runId: string; stage: string; at: number; message?: string }) => void
+    onStage?: (evt: { runId: string; stage: string; at: number; message?: string }) => void,
+    extraOptions?: { pdfAttachmentContext?: PdfAttachmentContext; userId?: string }
   ) => {
     try {
       const runIdRef = { current: '' };
@@ -271,49 +278,78 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
       let baseResult: any;
       try {
-        baseResult = await orchestratorRef.current.processMessage(input, messages, selectedSkills, selectedConnectors, selectedTemplate);
+        baseResult = await orchestratorRef.current.processMessage(
+          input,
+          messages,
+          selectedSkills,
+          selectedConnectors,
+          selectedTemplate,
+          extraOptions
+        );
       } finally {
         unsubscribe();
       }
 
       const skillExecutor = orchestratorRef.current.getSkillExecutor();
-      let toolSkillIdsRaw = orchestratorRef.current.resolveToolSkillIds(selectedSkills);
+      const explicitSkillIds = (selectedSkills || []).filter(Boolean);
 
-      let toolsetAllowlist: Set<string> | null = null;
-      try {
-        toolsetAllowlist = await resolveEnabledToolsetLogicalNames();
-      } catch {
-        toolsetAllowlist = null;
-      }
-      if (toolsetAllowlist && toolsetAllowlist.size > 0) {
-        toolSkillIdsRaw = filterSkillIdsByToolsetAllowlist(toolSkillIdsRaw, toolsetAllowlist, skillExecutor);
-      }
+      let tools: ToolDefinition[] = [];
+      let toolCallHandler: ToolCallHandler | undefined;
 
-      const topK =
-        typeof window !== 'undefined' && window.localStorage
-          ? Number(window.localStorage.getItem('yueli_tool_topk_skills') || 8) || 8
-          : 8;
-      let embeddingScores: Record<string, number> | undefined;
-      try {
-        embeddingScores = await recallSkillRoutingScoresFromMemory(input, toolSkillIdsRaw, apiService);
-      } catch {
-        embeddingScores = undefined;
-      }
+      if (explicitSkillIds.length > 0) {
+        let toolSkillIdsRaw = orchestratorRef.current.resolveToolSkillIds(explicitSkillIds);
 
-      const toolSkillIds = selectSkillIdsForTools(input, toolSkillIdsRaw, {
-        maxSkills: topK,
-        recentSkillIds: readRecentSkillIds(50),
-        embeddingScores
-      });
-      setLastToolRoundSkillIds(toolSkillIds);
-      let tools = skillExecutor.getAllToolDefinitions(toolSkillIds) as ToolDefinition[];
-      if (toolsetAllowlist && toolsetAllowlist.size > 0) {
-        tools = filterToolDefinitionsByAllowlist(tools, toolsetAllowlist);
-      }
+        if (baseResult.toolEligibleSkillIds !== undefined) {
+          const eligible = new Set(baseResult.toolEligibleSkillIds);
+          toolSkillIdsRaw = toolSkillIdsRaw.filter((id) => eligible.has(id));
+        }
 
-      const toolCallHandler: ToolCallHandler = async (toolName, args) => {
-        return await skillExecutor.executeToolCall(toolName, args);
-      };
+        let toolsetAllowlist: Set<string> | null = null;
+        try {
+          toolsetAllowlist = await resolveEnabledToolsetLogicalNames();
+        } catch {
+          toolsetAllowlist = null;
+        }
+        if (toolsetAllowlist && toolsetAllowlist.size > 0) {
+          toolSkillIdsRaw = filterSkillIdsByToolsetAllowlist(
+            toolSkillIdsRaw,
+            toolsetAllowlist,
+            skillExecutor
+          );
+        }
+
+        const topK =
+          typeof window !== 'undefined' && window.localStorage
+            ? Number(window.localStorage.getItem('yueli_tool_topk_skills') || 8) || 8
+            : 8;
+        let embeddingScores: Record<string, number> | undefined;
+        try {
+          embeddingScores = await recallSkillRoutingScoresFromMemory(
+            input,
+            toolSkillIdsRaw,
+            apiService
+          );
+        } catch {
+          embeddingScores = undefined;
+        }
+
+        const toolSkillIds = selectSkillIdsForTools(input, toolSkillIdsRaw, {
+          maxSkills: topK,
+          recentSkillIds: readRecentSkillIds(50),
+          embeddingScores
+        });
+        setLastToolRoundSkillIds(toolSkillIds);
+        tools = skillExecutor.getAllToolDefinitions(toolSkillIds) as ToolDefinition[];
+        if (toolsetAllowlist && toolsetAllowlist.size > 0) {
+          tools = filterToolDefinitionsByAllowlist(tools, toolsetAllowlist);
+        }
+
+        toolCallHandler = async (toolName, args) => {
+          return await skillExecutor.executeToolCall(toolName, args);
+        };
+      } else {
+        setLastToolRoundSkillIds([]);
+      }
 
       // RAG：仅在「知识库注入策略 = 向量」时请求 KGM，避免全量/关闭模式下多余检索
       let ragContext: string | undefined;
@@ -322,9 +358,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         try {
           const activeIds = new Set(knowledgeItems.map(k => k.id));
           const searchResult = await apiService.kgmMemorySearch(input, undefined, 8);
-          if (searchResult?.results?.length > 0) {
+          const hits = searchResult?.results ?? [];
+          if (hits.length > 0) {
             // 过滤掉已删除知识库的旧向量块
-            const validResults = searchResult.results.filter(
+            const validResults = hits.filter(
               (r: any) => !r.metadata?.knowledgeId || activeIds.has(r.metadata.knowledgeId)
             );
             if (validResults.length > 0) {
@@ -343,10 +380,10 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
       try {
         skillInstallRequests = await orchestratorRef.current.analyzeSkillUrls(input);
         if (skillInstallRequests.length > 0) {
-          console.log('[ChatContext] 检测到技能 URL:', skillInstallRequests.map(r => r.url));
+          devLog('[ChatContext] 检测到技能 URL:', skillInstallRequests.map(r => r.url));
         }
       } catch (error) {
-        console.warn('Failed to analyze skill URLs:', error);
+        devWarn('Failed to analyze skill URLs:', error);
       }
 
       return {
@@ -354,7 +391,8 @@ export const ChatProvider: React.FC<{ children: React.ReactNode }> = ({ children
         tools: tools.length > 0 ? tools : undefined,
         toolCallHandler: tools.length > 0 ? toolCallHandler : undefined,
         ragContext,
-        skillInstallRequests
+        skillInstallRequests,
+        toolEligibleSkillIds: baseResult.toolEligibleSkillIds
       };
     } catch (error) {
       console.error('processWithOrchestrator failed:', error);

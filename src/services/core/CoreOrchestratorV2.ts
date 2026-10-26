@@ -29,6 +29,30 @@ import { ScheduleManager } from './ScheduleManager';
 import { SkillExecutor } from '../SkillExecutor';
 import { MCPConnectorManager } from '../MCPConnectorManager';
 import { TemplateEngine } from '../TemplateEngine';
+import { devLog, devWarn, devError } from '../../utils/devConsole';
+import { inputMatchesSkillTriggers } from './skillTriggerMatch';
+import { buildSkillInjectionPlan } from './skillInjectionPlan';
+import { topoSortSkillsByRequires } from './skillTopo';
+import type { PipelinePriorArtifact } from './pipelineSchemaContract';
+import {
+  buildPipelineInputs,
+  pipelineArtifactFromSkillResult,
+  pipelinePriorOutputsAsText
+} from './pipelineSchemaContract';
+import { formatSkillResultForInjection } from './skillResultFormatting';
+import {
+  buildPdfSkillExecutionVariables,
+  isPdfPrePipelineSkillId,
+  mergePdfSkillsIntoPrePipeline,
+  registerPdfBundledSkillsInOrchestrator,
+  type PdfAttachmentContext
+} from '../documents/pdfOrchestratorIntegration';
+import type { SkillManifest } from './SkillManifestSchema';
+import {
+  buildEvolutionPayloadFromSkillRun,
+  postSkillEvolutionFeedback
+} from './skillEvolutionMetrics';
+import { SkillStorage } from './SkillStorage';
 
 /**
  * 核心编排器 V2 - 完整的技能与连接器管理系统
@@ -111,6 +135,8 @@ export class CoreOrchestratorV2 {
     // 同步 SkillExecutor 发现的本地技能到 PluginManager（确保 .skills/ 目录的技能在 UI 中显示）
     await this.syncSkillsFromExecutorToPluginManager();
 
+    await registerPdfBundledSkillsInOrchestrator(this);
+
     this.isInitialized = true;
     await this.eventManager.emit('system:initialized');
   }
@@ -121,38 +147,38 @@ export class CoreOrchestratorV2 {
   private setupEventListeners(): void {
     // 技能事件
     this.eventManager.on('skill:installed', (event) => {
-      console.log('Skill installed:', event.pluginId, event.data);
+      devLog('Skill installed:', event.pluginId, event.data);
     });
 
     this.eventManager.on('skill:enabled', (event) => {
-      console.log('Skill enabled:', event.pluginId);
+      devLog('Skill enabled:', event.pluginId);
     });
 
     this.eventManager.on('skill:execution:start', (event) => {
-      console.log('Skill execution started:', event.pluginId, event.data);
+      devLog('Skill execution started:', event.pluginId, event.data);
     });
 
     this.eventManager.on('skill:execution:complete', (event) => {
-      console.log('Skill execution complete:', event.pluginId, event.data);
+      devLog('Skill execution complete:', event.pluginId, event.data);
     });
 
     this.eventManager.on('skill:execution:error', (event) => {
-      console.error('Skill execution error:', event.pluginId, event.data);
+      devError('Skill execution error:', event.pluginId, event.data);
     });
 
     // 连接器事件
     this.eventManager.on('connector:connected', (event) => {
-      console.log('Connector connected:', event.pluginId);
+      devLog('Connector connected:', event.pluginId);
     });
 
     // 资源事件
     this.eventManager.on('resource:acquired', (event) => {
-      console.log('Resource acquired:', event.data);
+      devLog('Resource acquired:', event.data);
     });
 
     // 审计事件
     this.eventManager.on('audit:record', (event) => {
-      console.log('Audit record:', event.data);
+      devLog('Audit record:', event.data);
     });
   }
 
@@ -224,6 +250,7 @@ export class CoreOrchestratorV2 {
       selectedConnectors?: any[];
       selectedTemplate?: string;
       userId?: string;
+      pdfAttachmentContext?: PdfAttachmentContext;
     } = {}
   ): Promise<ExecutionResult> {
     await this.initialize();
@@ -235,10 +262,13 @@ export class CoreOrchestratorV2 {
       connectorResults: {}
     };
 
+    let injectionAnalysis: any = null;
+
     try {
       // 1. 分析阶段
       this.emitStage(runId, 'analyze:start');
       const analysis = await this.analyzeInput(input, history, options);
+      injectionAnalysis = analysis;
       this.emitStage(runId, 'analyze:end');
 
       // 2. 准备阶段
@@ -261,6 +291,22 @@ export class CoreOrchestratorV2 {
       result.connectorResults = transformedResult.connectorResults;
       result.renderedOutput = transformedResult.renderedOutput;
 
+      if (injectionAnalysis?.skillsPrePipeline?.length) {
+        const fragments: string[] = [];
+        for (const sid of injectionAnalysis.skillsPrePipeline as string[]) {
+          const sr = transformedResult.skillResults?.[sid];
+          const text = this.skillResultToInjectableText(sid, sr);
+          if (text.trim()) fragments.push(`## 技能预注入 (${sid})\n\n${text}`);
+        }
+        if (fragments.length > 0) {
+          result.enhancedUserPrompt = [...fragments, input].join('\n\n---\n\n');
+        }
+      }
+
+      result.toolEligibleSkillIds = injectionAnalysis
+        ? [...new Set((injectionAnalysis.skillsToolEligible || []) as string[])]
+        : undefined;
+
       this.emitStage(runId, 'complete:start');
       await this.completeExecution(result);
       this.emitStage(runId, 'complete:end');
@@ -276,6 +322,11 @@ export class CoreOrchestratorV2 {
     return result;
   }
 
+  /** 将技能管道结果转为可拼进用户消息的文本（Markdown 友好，避免 JSON 单行墙） */
+  private skillResultToInjectableText(skillId: string, skillResult: any): string {
+    return formatSkillResultForInjection(skillId, skillResult);
+  }
+
   /**
    * 分析输入
    */
@@ -284,9 +335,23 @@ export class CoreOrchestratorV2 {
     history: Message[],
     options: any
   ): Promise<any> {
-    console.log('Analyzing input:', input);
+    devLog('Analyzing input:', input);
 
-    const analysis = {
+    const analysis: {
+      input: string;
+      history: Message[];
+      options: any;
+      skillsToExecute: any;
+      connectorsToUse: any;
+      templateToUse: any;
+      detectedSkills: string[];
+      detectedConnectors: any[];
+      requiresResources: string[];
+      skillUrlsToInstall: SkillInstallRequest[];
+      skillsPrePipeline: string[];
+      skillsToolEligible: string[];
+      pdfAttachmentContext?: PdfAttachmentContext;
+    } = {
       input,
       history,
       options,
@@ -296,7 +361,9 @@ export class CoreOrchestratorV2 {
       detectedSkills: [] as string[],
       detectedConnectors: [] as any[],
       requiresResources: [] as string[],
-      skillUrlsToInstall: [] as SkillInstallRequest[]
+      skillUrlsToInstall: [] as SkillInstallRequest[],
+      skillsPrePipeline: [],
+      skillsToolEligible: []
     };
 
     // 1. 自动检测技能仓库 URL
@@ -324,15 +391,27 @@ export class CoreOrchestratorV2 {
           });
         }
       } catch (error) {
-        console.warn('Failed to discover skill from URL:', url, error);
+        devWarn('Failed to discover skill from URL:', url, error);
       }
     }
 
-    // 2. 自动检测技能调用
+    // 2. 自动检测技能调用（triggers / @id / 名称）
     const enabledSkills = this.pluginManager.getEnabledSkills();
+    const storage = new SkillStorage();
+    await storage.open().catch(() => {});
     for (const skill of enabledSkills) {
-      if (input.includes(skill.name) || input.includes(`@${skill.id}`)) {
-        analysis.skillsToExecute.push(skill.id);
+      let matched =
+        input.includes(skill.name) || input.includes(`@${skill.id}`);
+      if (!matched) {
+        const installed = await storage.get(skill.id).catch(() => null);
+        if (installed?.manifest) {
+          matched = inputMatchesSkillTriggers(input, installed.manifest);
+        }
+      }
+      if (matched) {
+        if (!analysis.skillsToExecute.includes(skill.id)) {
+          analysis.skillsToExecute.push(skill.id);
+        }
         analysis.detectedSkills.push(skill.id);
       }
     }
@@ -340,6 +419,33 @@ export class CoreOrchestratorV2 {
     // 3. 自动检测连接器需求
     if (input.includes('天气') || input.includes('weather')) {
       analysis.requiresResources.push('api');
+    }
+
+    // 4. 按 manifest.context_injection.mode 拆分预执行管道 vs 对话 tools
+    const orderedIds = [...new Set(analysis.skillsToExecute as string[])];
+    const manifestMap = new Map<
+      string,
+      import('./SkillManifestSchema').SkillManifest | undefined
+    >();
+    for (const skillId of orderedIds) {
+      const installed = await storage.get(skillId).catch(() => null);
+      manifestMap.set(skillId, installed?.manifest);
+    }
+    const plan = buildSkillInjectionPlan(orderedIds, manifestMap);
+    analysis.skillsPrePipeline = topoSortSkillsByRequires(plan.skillsPrePipeline, manifestMap);
+    analysis.skillsToolEligible = plan.skillsToolEligible;
+
+    if (options?.pdfAttachmentContext) {
+      analysis.pdfAttachmentContext = options.pdfAttachmentContext;
+      for (const sid of ['yueli-pdf-structural-analyst', 'yueli-pdf-summarizer', 'yueli-pdf-paraphraser', 'yueli-pdf-data-extractor']) {
+        if (!analysis.skillsToExecute.includes(sid)) {
+          analysis.skillsToExecute.push(sid);
+        }
+      }
+      analysis.skillsPrePipeline = topoSortSkillsByRequires(
+        mergePdfSkillsIntoPrePipeline(analysis.skillsPrePipeline, manifestMap),
+        manifestMap
+      );
     }
 
     return analysis;
@@ -526,7 +632,7 @@ export class CoreOrchestratorV2 {
           });
         }
       } catch (error) {
-        console.warn('Failed to analyze skill URL:', url, error);
+        devWarn('Failed to analyze skill URL:', url, error);
       }
     }
 
@@ -537,23 +643,27 @@ export class CoreOrchestratorV2 {
    * 准备执行
    */
   private async prepareExecution(analysis: any): Promise<void> {
-    console.log('Preparing execution:', analysis);
+    devLog('Preparing execution:', analysis);
 
     // 获取所需资源
     for (const resourceType of analysis.requiresResources) {
       try {
         await this.resourceManager.acquireResource(resourceType, 'system');
       } catch (error) {
-        console.warn('Failed to acquire resource, continuing anyway:', error);
+        devWarn('Failed to acquire resource, continuing anyway:', error);
       }
     }
 
-    // 创建技能执行实例
-    for (const skillId of analysis.skillsToExecute) {
+    const prepSkillIds: string[] = Array.isArray(analysis.skillsPrePipeline)
+      ? analysis.skillsPrePipeline
+      : analysis.skillsToExecute;
+
+    // 创建技能执行实例（与预管道一致，避免纯 post_llm 技能产生误导性实例）
+    for (const skillId of prepSkillIds) {
       try {
         this.pluginManager.createSkillExecution(skillId, { input: analysis.input });
       } catch (error) {
-        console.warn('Failed to create skill execution:', error);
+        devWarn('Failed to create skill execution:', error);
       }
     }
   }
@@ -562,7 +672,7 @@ export class CoreOrchestratorV2 {
    * 执行管道
    */
   private async executePipeline(analysis: any): Promise<any> {
-    console.log('Executing pipeline:', analysis);
+    devLog('Executing pipeline:', analysis);
 
     const results: {
       skillResults: Record<string, any>;
@@ -572,20 +682,67 @@ export class CoreOrchestratorV2 {
       connectorResults: {}
     };
 
-    // 执行技能
-    for (const skillId of analysis.skillsToExecute) {
+    const runIds: string[] = Array.isArray(analysis.skillsPrePipeline)
+      ? analysis.skillsPrePipeline
+      : analysis.skillsToExecute;
+
+    /** 拓扑序靠前的技能产出（文本 + 结构化），供 pipeline 契约与 prompt 注入 */
+    const pipelinePriorArtifacts: Record<string, PipelinePriorArtifact> = {};
+
+    const pdfBatch = runIds.filter((id) => isPdfPrePipelineSkillId(id));
+    const nonPdfRunIds = runIds.filter((id) => !isPdfPrePipelineSkillId(id));
+
+    const runOneSkill = async (skillId: string) => {
+      const pipeStart = Date.now();
       try {
-        const skillResult = await this.executeSkill(skillId, analysis);
+        const skillResult = await this.executeSkill(skillId, analysis, pipelinePriorArtifacts);
         results.skillResults[skillId] = skillResult;
-        
+
+        const skillMeta = this.pluginManager.getSkill(skillId);
+        const pipeSuccess = skillResult?.success !== false;
+        const pipeResultText =
+          typeof skillResult?.result === 'string'
+            ? skillResult.result
+            : skillResult?.result != null
+              ? JSON.stringify(skillResult.result)
+              : '';
+        void postSkillEvolutionFeedback(
+          buildEvolutionPayloadFromSkillRun({
+            skillId,
+            skillName: skillMeta?.name || skillId,
+            startTimeMs: pipeStart,
+            success: pipeSuccess,
+            error: skillResult?.error,
+            resultText: pipeResultText,
+            result_valid: skillResult?.result_valid,
+            toolCalls: skillResult?.toolCalls,
+            userInput: analysis.input,
+            variables: { pipelinePriorOutputs: pipelinePriorOutputsAsText(pipelinePriorArtifacts) },
+            phase: 'pipeline_pre'
+          })
+        );
+
+        const producerManifest = await this.skillInstaller.getInstalledManifest(skillId);
+        const artifact = pipelineArtifactFromSkillResult(skillId, skillResult, producerManifest ?? undefined);
+        if (artifact.text.trim() || artifact.structured !== null) {
+          pipelinePriorArtifacts[skillId] = artifact;
+        }
+
         await this.pluginManager.updateExecutionState(skillId, 'skill', {
           progress: 50,
           progressMessage: 'Skill executed successfully'
         });
       } catch (error) {
-        console.error('Skill execution failed:', skillId, error);
+        devError('Skill execution failed:', skillId, error);
         await this.pluginManager.handleExecutionError(skillId, 'skill', error as Error);
       }
+    };
+
+    if (pdfBatch.length > 0) {
+      await Promise.all(pdfBatch.map((id) => runOneSkill(id)));
+    }
+    for (const skillId of nonPdfRunIds) {
+      await runOneSkill(skillId);
     }
 
     // 执行连接器
@@ -594,7 +751,7 @@ export class CoreOrchestratorV2 {
         const connectorResult = await this.executeConnector(connector, analysis);
         results.connectorResults[connector.id] = connectorResult;
       } catch (error) {
-        console.error('Connector execution failed:', connector.id, error);
+        devError('Connector execution failed:', connector.id, error);
       }
     }
 
@@ -604,20 +761,42 @@ export class CoreOrchestratorV2 {
   /**
    * 执行单个技能
    */
-  private async executeSkill(skillId: string, analysis: any): Promise<any> {
+  private async executeSkill(
+    skillId: string,
+    analysis: any,
+    pipelinePriorArtifacts: Record<string, PipelinePriorArtifact> = {}
+  ): Promise<any> {
     const skill = this.pluginManager.getSkill(skillId);
     if (!skill) {
       throw new Error(`Skill ${skillId} not found`);
     }
 
+    const consumerManifest = await this.skillInstaller.getInstalledManifest(skillId);
+    const producerManifests: Record<string, SkillManifest | undefined> = {};
+    for (const pid of Object.keys(pipelinePriorArtifacts)) {
+      producerManifests[pid] = (await this.skillInstaller.getInstalledManifest(pid)) ?? undefined;
+    }
+    const pipelineInputs =
+      consumerManifest && Object.keys(pipelinePriorArtifacts).length > 0
+        ? buildPipelineInputs(consumerManifest, pipelinePriorArtifacts, producerManifests)
+        : {};
+    const pipelinePriorOutputs = pipelinePriorOutputsAsText(pipelinePriorArtifacts);
+
     // 使用旧版SkillExecutor兼容执行
     const oldSkill = this.skillExecutor.getSkill(skillId);
     if (oldSkill) {
+      const pdfVars = analysis.pdfAttachmentContext && isPdfPrePipelineSkillId(skillId)
+        ? buildPdfSkillExecutionVariables(analysis.pdfAttachmentContext, skillId)
+        : {};
       const context = {
         skill: oldSkill,
         userInput: analysis.input,
         history: analysis.history,
-        variables: {}
+        variables: {
+          pipelinePriorOutputs: { ...pipelinePriorOutputs },
+          pipelineInputs: { ...pipelineInputs },
+          ...pdfVars
+        }
       };
       const result = await this.skillExecutor.executeSkill(skillId, context);
       return result;
@@ -647,7 +826,7 @@ export class CoreOrchestratorV2 {
    * 转换结果
    */
   private async transformResults(executionResult: any): Promise<any> {
-    console.log('Transforming results:', executionResult);
+    devLog('Transforming results:', executionResult);
 
     const transformed = {
       ...executionResult,
@@ -683,7 +862,7 @@ export class CoreOrchestratorV2 {
    * 完成执行
    */
   private async completeExecution(result: ExecutionResult): Promise<void> {
-    console.log('Completing execution:', result);
+    devLog('Completing execution:', result);
 
     // 释放资源
     const resources = this.resourceManager.getPoolStatus('api');
@@ -705,7 +884,7 @@ export class CoreOrchestratorV2 {
    * 处理执行错误
    */
   private async handleExecutionError(error: any): Promise<void> {
-    console.error('Execution error:', error);
+    devError('Execution error:', error);
 
     // 记录错误到审计系统
     this.auditSystem.record(AuditType.EXECUTE, 'system', 'failed', {
@@ -842,10 +1021,10 @@ export class CoreOrchestratorV2 {
       }
 
       if (syncedCount > 0) {
-        console.log(`[CoreOrchestratorV2] 已同步 ${syncedCount} 个技能从 SkillExecutor 到 PluginManager`);
+        devLog(`[CoreOrchestratorV2] 已同步 ${syncedCount} 个技能从 SkillExecutor 到 PluginManager`);
       }
     } catch (error) {
-      console.warn('[CoreOrchestratorV2] 同步技能到 PluginManager 失败:', error);
+      devWarn('[CoreOrchestratorV2] 同步技能到 PluginManager 失败:', error);
     }
   }
 
@@ -866,19 +1045,26 @@ export class CoreOrchestratorV2 {
     history: Message[],
     selectedSkills?: string[],
     selectedConnectors?: any[],
-    selectedTemplate?: string
+    selectedTemplate?: string,
+    extraOptions?: {
+      pdfAttachmentContext?: PdfAttachmentContext;
+      userId?: string;
+    }
   ): Promise<any> {
     const result = await this.processInput(input, history, {
       selectedSkills,
       selectedConnectors,
-      selectedTemplate
+      selectedTemplate,
+      ...extraOptions
     });
 
     return {
-      enhancedPrompt: input,
+      enhancedPrompt: result.enhancedUserPrompt ?? input,
       connectorData: result.connectorResults,
       renderedOutput: result.renderedOutput,
-      shouldUseLLM: true
+      shouldUseLLM: true,
+      toolEligibleSkillIds: result.toolEligibleSkillIds,
+      skillResults: result.skillResults
     };
   }
 

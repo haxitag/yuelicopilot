@@ -1,0 +1,25 @@
+{
+  "name": "yueli-copilot-desktop",
+  "productName": "Yueli Copilot",
+  "version": "0.1.0",
+  "description": "Yueli Copilot macOS desktop shell",
+  "private": true,
+  "type": "module",
+  "main": "electron/main.mjs",
+  "author": "Yueli",
+  "license": "MIT",
+  "scripts": {
+    "dev": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --mac dmg",
+    "dist:universal": "electron-builder --mac dmg --universal"
+  },
+  "devDependencies": {
+    "@electron/notarize": "^2.5.0",
+    "electron": "^35.1.2",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "extends": "electron-builder.yml"
+  }
+}

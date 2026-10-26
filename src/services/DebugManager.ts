@@ -4,6 +4,7 @@ class DebugManager {
   private isEnabled = false;
   private entries: DebugEntry[] = [];
   private listeners: Set<(entries: DebugEntry[]) => void> = new Set();
+  private stateListeners: Set<(enabled: boolean) => void> = new Set();
 
   constructor() {
     const saved = localStorage.getItem('yueli_debug_enabled');
@@ -11,8 +12,10 @@ class DebugManager {
   }
 
   setEnabled(enabled: boolean) {
+    if (this.isEnabled === enabled) return;
     this.isEnabled = enabled;
     localStorage.setItem('yueli_debug_enabled', String(enabled));
+    this.notifyStateListeners();
     this.notifyListeners();
   }
 
@@ -89,8 +92,17 @@ class DebugManager {
     return () => this.listeners.delete(listener);
   }
 
+  subscribeState(listener: (enabled: boolean) => void) {
+    this.stateListeners.add(listener);
+    return () => this.stateListeners.delete(listener);
+  }
+
   private notifyListeners() {
     this.listeners.forEach(listener => listener([...this.entries]));
+  }
+
+  private notifyStateListeners() {
+    this.stateListeners.forEach(listener => listener(this.isEnabled));
   }
 
   toggle() {

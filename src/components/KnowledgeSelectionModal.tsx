@@ -2,6 +2,7 @@ import React, { useState, useCallback } from 'react';
 import styled from 'styled-components';
 import { useChat, KnowledgeItem } from '../contexts/ChatContext';
 import { toast } from 'react-hot-toast';
+import { useEscapeClose } from '../hooks/useEscapeClose';
 
 interface Props {
   isOpen: boolean;
@@ -81,8 +82,7 @@ const Btn = styled.button<{ primary?: boolean }>`
   &:hover { opacity: 0.85; }
 `;
 const IndexingNote = styled.div`
-  font-size: 12px; color: #888; margin-top: 6px; padding: 6px 10px;
-  background: #f9f9f9; border-radius: 4px;
+  font-size: 12px; color: #777; margin-top: 6px;
 `;
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -95,6 +95,7 @@ const KnowledgeSelectionModal: React.FC<Props> = ({ isOpen, onClose, selectedKno
   const [textName, setTextName] = useState('');
   const [urlInput, setUrlInput] = useState('');
   const [loading, setLoading] = useState(false);
+  useEscapeClose(isOpen, onClose);
 
   const toggle = (id: string) => {
     setSelected(prev => prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id]);
@@ -246,7 +247,7 @@ const KnowledgeSelectionModal: React.FC<Props> = ({ isOpen, onClose, selectedKno
     <Overlay onClick={e => e.target === e.currentTarget && onClose()}>
       <Modal>
         <Header>
-          <Title>📚 项目主题知识库</Title>
+          <Title>项目主题知识库</Title>
           <CloseBtn onClick={onClose}>×</CloseBtn>
         </Header>
 
@@ -254,7 +255,7 @@ const KnowledgeSelectionModal: React.FC<Props> = ({ isOpen, onClose, selectedKno
           {/* 已有知识库列表 */}
           {knowledgeItems.length === 0 && (
             <div style={{ color: '#aaa', fontSize: 13, textAlign: 'center', padding: '20px 0' }}>
-              暂无知识库内容，请从下方添加
+              暂无内容
             </div>
           )}
           {knowledgeItems.map(item => (
@@ -276,8 +277,8 @@ const KnowledgeSelectionModal: React.FC<Props> = ({ isOpen, onClose, selectedKno
                   <Badge color="blue">{item.type === 'file' ? '文件' : item.type === 'url' ? 'URL' : '文本'}</Badge>
                   <span>{Math.round(item.content.length / 1000)}k 字符</span>
                   {item.indexed
-                    ? <Badge color="green">✓ 已向量化 ({item.chunkCount} 块)</Badge>
-                    : <Badge>未向量化（全量注入）</Badge>
+                    ? <Badge color="green">已向量化 ({item.chunkCount} 块)</Badge>
+                    : <Badge>未向量化</Badge>
                   }
                 </ItemMeta>
               </ItemInfo>
@@ -293,10 +294,10 @@ const KnowledgeSelectionModal: React.FC<Props> = ({ isOpen, onClose, selectedKno
           <AddSection>
             <AddTitle>添加知识内容</AddTitle>
             <AddBtnRow>
-              <AddBtn disabled={loading} onClick={handleAddFiles}>📄 添加文件</AddBtn>
-              <AddBtn disabled={loading} onClick={handleAddFolder}>📁 添加文件夹</AddBtn>
-              <AddBtn disabled={loading} onClick={() => setAddMode(addMode === 'text' ? 'none' : 'text')}>✏️ 粘贴文本</AddBtn>
-              <AddBtn disabled={loading} onClick={() => setAddMode(addMode === 'url' ? 'none' : 'url')}>🔗 抓取 URL</AddBtn>
+              <AddBtn disabled={loading} onClick={handleAddFiles}>添加文件</AddBtn>
+              <AddBtn disabled={loading} onClick={handleAddFolder}>添加文件夹</AddBtn>
+              <AddBtn disabled={loading} onClick={() => setAddMode(addMode === 'text' ? 'none' : 'text')}>粘贴文本</AddBtn>
+              <AddBtn disabled={loading} onClick={() => setAddMode(addMode === 'url' ? 'none' : 'url')}>抓取 URL</AddBtn>
             </AddBtnRow>
 
             {addMode === 'text' && (
@@ -338,8 +339,7 @@ const KnowledgeSelectionModal: React.FC<Props> = ({ isOpen, onClose, selectedKno
             )}
 
             <IndexingNote>
-              内容添加后会自动分块写入 KGM 向量索引（需配置 embedding）。
-              未配置时内容仍可用，以全量方式注入 context。
+              向量索引后台处理。
             </IndexingNote>
           </AddSection>
         </Body>

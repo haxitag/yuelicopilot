@@ -4,6 +4,7 @@
  */
 
 import { resolveSkillExecutorAuthHeaders, resolveSkillExecutorBaseUrl } from '../../utils/skillExecutorUrl';
+import { devLog, devError } from '../../utils/devConsole';
 
 export interface MCPServerConfig {
   id: string;
@@ -170,7 +171,7 @@ class MCPWebSocketClient {
           }
           this.messageHandlers.forEach(h => h(data));
         } catch (e) {
-          console.error('MCP WS parse error:', e);
+          devError('MCP WS parse error:', e);
         }
       };
     });
@@ -318,7 +319,7 @@ export class MCPRuntime {
       status.lastConnected = new Date();
       this.serverStatus.set(id, status);
 
-      console.log(`MCP server ${id} connected with ${tools.length} tools`);
+      devLog(`MCP server ${id} connected with ${tools.length} tools`);
     } catch (error) {
       status.connected = false;
       status.error = error instanceof Error ? error.message : String(error);

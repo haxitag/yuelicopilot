@@ -1,0 +1,11 @@
+{
+  "name": "@yuelicopilot/gateway",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Single-origin gateway for desktop profile (/kgm, /api, static dist)",
+  "exports": {
+    ".": "./src/server.mjs",
+    "./proxyRoutes": "./src/proxyRoutes.mjs"
+  }
+}

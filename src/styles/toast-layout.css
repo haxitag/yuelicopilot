@@ -1,0 +1,14 @@
+/* 与 App.tsx <Toaster position="bottom-center" /> 对齐：antd message 也固定在底部居中 */
+.ant-message {
+  top: auto !important;
+  bottom: 72px !important;
+  left: 50% !important;
+  right: auto !important;
+  transform: translateX(-50%);
+  width: max-content;
+  max-width: min(520px, calc(100vw - 36px));
+}
+
+.ant-message-notice-content {
+  text-align: center;
+}

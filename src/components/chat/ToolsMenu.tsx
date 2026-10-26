@@ -1,11 +1,14 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import { Tabs, Input, Checkbox, Empty, Divider, Select, Button, Switch, Typography, Segmented } from 'antd';
 
 import type { ChatProvider, ModelOption } from '../../services/chat/ModelOptions';
+import type { TieredModelOption } from '../../services/chat/inferenceModelTiers';
+import { tieredOptionsToSelectGroups } from '../../services/chat/inferenceModelTiers';
 import type { KnowledgeScopeMode } from '../../services/chat/KnowledgeScope';
 import SkillsHubPanel from './SkillsHubPanel';
 import ToolsetPanel from './ToolsetPanel';
 import ToolVectorRoutingPanel from './ToolVectorRoutingPanel';
+import { useL2ModelRoutability } from '../../hooks/useL2ModelRoutability';
 
 export interface ToolsMenuSkill {
   id: string;
@@ -18,12 +21,14 @@ export interface ToolsMenuProps {
   activeSkillIds: string[];
   onToggleSkill: (skillId: string) => void;
 
-  modelOptions: ModelOption[];
+  modelOptions: (ModelOption | TieredModelOption)[];
   selectedProvider: ChatProvider;
   selectedModel: string;
   onChangeProviderModel: (provider: ChatProvider, model: string) => void;
 
-  onUploadFiles: () => void;
+  onUploadFiles: () => void | Promise<void>;
+  /** 在 click 之前调用，避免 Popover 因失焦先收起（须在 mousedown 同步执行） */
+  onPrepareFilePick?: () => void;
 
   /**
    * 与既有上下文构建链路对齐（不在此 Popover 内重复实现 RAG/buildMessages）：
@@ -33,6 +38,7 @@ export interface ToolsMenuProps {
   selectedPromptsCount?: number;
   lastToolRoundSkillIds?: string[];
   onOpenKnowledgeSelection?: () => void;
+  onOpenChatDocuments?: () => void;
   onOpenPromptTemplates?: () => void;
 
   defaultTabKey?: 'attachments' | 'skills' | 'model' | 'hub' | 'toolsets' | 'routing';
@@ -54,7 +60,7 @@ export interface ToolsMenuProps {
   streamIncludeUsageHasLocalOverride?: boolean;
   onResetStreamIncludeUsageDefault?: () => void;
 
-  /** 知识库注入策略：全量 / 仅向量片段 / 关闭（localStorage.yueli_knowledge_scope） */
+  /** 知识库注入策略：全量 / 仅向量片段 / 不引入本地知识库（localStorage.yueli_knowledge_scope） */
   knowledgeScope?: KnowledgeScopeMode;
   onKnowledgeScopeChange?: (mode: KnowledgeScopeMode) => void;
 
@@ -75,6 +81,7 @@ export default function ToolsMenu(props: ToolsMenuProps) {
     selectedModel,
     onChangeProviderModel,
     onUploadFiles,
+    onPrepareFilePick,
     defaultTabKey = 'attachments',
     allowSkillEntry = false,
     onAllowSkillEntryChange,
@@ -90,6 +97,7 @@ export default function ToolsMenu(props: ToolsMenuProps) {
     selectedPromptsCount = 0,
     lastToolRoundSkillIds = [],
     onOpenKnowledgeSelection,
+    onOpenChatDocuments,
     onOpenPromptTemplates,
     installSkillFromUrl,
     onHubSkillInstalled,
@@ -98,6 +106,7 @@ export default function ToolsMenu(props: ToolsMenuProps) {
 
   const [activeTab, setActiveTab] = useState<string>(defaultTabKey);
   const [skillQuery, setSkillQuery] = useState('');
+  const [advancedModelTiers, setAdvancedModelTiers] = useState(false);
 
   useEffect(() => {
     setActiveTab(defaultTabKey);
@@ -114,6 +123,51 @@ export default function ToolsMenu(props: ToolsMenuProps) {
   }, [skills, skillQuery]);
 
   const modelValue = `${selectedProvider}:${selectedModel}`;
+  const { routability, probing } = useL2ModelRoutability(modelOptions);
+
+  const applyL2Routability = useCallback(
+    (groups: { label: string; options: { value: string; label: string }[] }[]) =>
+      groups.map((g) => ({
+        ...g,
+        options: g.options.map((opt) => {
+          const tierOpt = modelOptions.find(
+            (o): o is TieredModelOption => 'tier' in o && o.value === opt.value
+          );
+          if (!tierOpt || tierOpt.tier !== 'L2') return opt;
+          const probed = routability.get(opt.value);
+          if (probed === undefined || probed) return opt;
+          return {
+            ...opt,
+            disabled: true,
+            title: 'KGM 未配置该模型的可路由上游，请在 Playground 检查 routes 或云端推理配置'
+          };
+        })
+      })),
+    [modelOptions, routability]
+  );
+
+  const modelSelectOptions = useMemo((): {
+    label: string;
+    options: { value: string; label: string; disabled?: boolean; title?: string }[];
+  }[] => {
+    const tiered = modelOptions.filter((o): o is TieredModelOption => 'tier' in o && 'group' in o);
+    if (tiered.length === 0) {
+      return [{ label: '模型', options: modelOptions.map((o) => ({ value: o.value, label: o.label })) }];
+    }
+    if (advancedModelTiers) return applyL2Routability(tieredOptionsToSelectGroups(tiered));
+    const intent: TieredModelOption[] = [];
+    const auto = tiered.find((o) => o.value === 'kgm:kgm-dynamic');
+    if (auto) {
+      intent.push({ ...auto, group: '推荐', label: '自动 · 成本与体验平衡' });
+    }
+    const free = tiered.find((o) => o.value === 'yueliai:freemodel');
+    if (free) intent.push({ ...free, group: '推荐', label: 'Yueli AI 免费聚合' });
+    for (const o of tiered.filter((t) => t.tier === 'L2').slice(0, 8)) {
+      intent.push({ ...o, group: '指定模型', label: o.label });
+    }
+    const groups = tieredOptionsToSelectGroups(intent.length ? intent : tiered);
+    return applyL2Routability(groups);
+  }, [modelOptions, advancedModelTiers, applyL2Routability]);
 
   return (
     <div style={{ width: 400 }}>
@@ -126,7 +180,18 @@ export default function ToolsMenu(props: ToolsMenuProps) {
             label: '附件',
             children: (
               <div style={{ paddingTop: 8 }}>
-                <Button onClick={onUploadFiles} block>
+                <Button
+                  block
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    onPrepareFilePick?.();
+                  }}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void onUploadFiles();
+                  }}
+                >
                   上传图片和文件
                 </Button>
                 <div style={{ marginTop: 8, color: '#666', fontSize: 12 }}>
@@ -152,11 +217,16 @@ export default function ToolsMenu(props: ToolsMenuProps) {
                       本轮 Top-K 工具技能：<Typography.Text code>{lastToolRoundSkillIds.join(', ')}</Typography.Text>
                     </div>
                   )}
-                  {(onOpenKnowledgeSelection || onOpenPromptTemplates) && (
+                  {(onOpenKnowledgeSelection || onOpenChatDocuments || onOpenPromptTemplates) && (
                     <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
                       {onOpenKnowledgeSelection && (
                         <Button size="small" onClick={onOpenKnowledgeSelection}>
                           管理知识库 / RAG 范围
+                        </Button>
+                      )}
+                      {onOpenChatDocuments && (
+                        <Button size="small" onClick={onOpenChatDocuments}>
+                          会话文档 / 长期记忆
                         </Button>
                       )}
                       {onOpenPromptTemplates && (
@@ -173,16 +243,16 @@ export default function ToolsMenu(props: ToolsMenuProps) {
                         知识库注入策略
                       </Typography.Text>
                       <Typography.Paragraph type="secondary" style={{ fontSize: 11, margin: '6px 0 10px' }}>
-                        「向量」依赖已索引的 KGM memory；无结果时自动回退全量条目。「关闭」则不向模型注入知识库正文。
+                        「向量」依赖已索引的 KGM memory；无结果时自动回退全量条目。「不引入本地知识库」则不向模型注入知识库正文。
                       </Typography.Paragraph>
                       <Segmented
                         size="small"
                         value={knowledgeScope}
                         onChange={(v) => onKnowledgeScopeChange(v as KnowledgeScopeMode)}
                         options={[
-                          { label: '全量', value: 'full' },
                           { label: '向量', value: 'vector' },
-                          { label: '关闭', value: 'off' }
+                          { label: '全量', value: 'full' },
+                          { label: '不引入本地知识库', value: 'off' }
                         ]}
                         block
                       />
@@ -321,10 +391,23 @@ export default function ToolsMenu(props: ToolsMenuProps) {
                 <div style={{ fontSize: 12, color: '#666', marginBottom: 8 }}>
                   选择 Provider/Model（会影响本轮与后续对话的推理服务）。
                 </div>
+                <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, marginBottom: 8 }}>
+                  <input
+                    type="checkbox"
+                    checked={advancedModelTiers}
+                    onChange={(e) => setAdvancedModelTiers(e.target.checked)}
+                  />
+                  显示高级分层（L1/L2/L3 技术选项）
+                </label>
+                {probing && (
+                  <Typography.Text type="secondary" style={{ fontSize: 11, display: 'block', marginBottom: 6 }}>
+                    正在探测 L2 模型可路由性…
+                  </Typography.Text>
+                )}
                 <Select
                   value={modelValue}
                   style={{ width: '100%' }}
-                  options={modelOptions.map((o) => ({ value: o.value, label: o.label }))}
+                  options={modelSelectOptions}
                   onChange={(value) => {
                     const [p, ...rest] = String(value).split(':');
                     const m = rest.join(':');

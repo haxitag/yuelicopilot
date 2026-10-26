@@ -1,9 +1,12 @@
 import React from 'react';
 import styled from 'styled-components';
 import { InferenceResult } from '../types';
+import DeckMarkdownRenderer from './deck-render/DeckMarkdownRenderer';
 
 interface InferenceResultRendererProps {
   result: InferenceResult;
+  /** 与聊天区一致，供 Markdown 正文使用 */
+  theme?: 'light' | 'dark';
 }
 
 const ResultContainer = styled.div`
@@ -12,6 +15,9 @@ const ResultContainer = styled.div`
   border-radius: 8px;
   background-color: #f8f9fa;
   border: 1px solid #e0e0e0;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
 `;
 
 const ResultHeader = styled.div`
@@ -82,11 +88,15 @@ const TableCell = styled.td`
   border: 1px solid #e0e0e0;
 `;
 
-const InferenceResultRenderer: React.FC<InferenceResultRendererProps> = ({ result }) => {
+const InferenceResultRenderer: React.FC<InferenceResultRendererProps> = ({ result, theme = 'light' }) => {
   const renderContent = () => {
     switch (result.type) {
       case 'text':
-        return <ResultContent>{result.content}</ResultContent>;
+        return (
+          <ResultContent>
+            <DeckMarkdownRenderer content={result.content} theme={theme} />
+          </ResultContent>
+        );
       case 'code':
         return (
           <CodeBlock>
@@ -152,9 +162,11 @@ const InferenceResultRenderer: React.FC<InferenceResultRendererProps> = ({ resul
 
   return (
     <ResultContainer>
-      <ResultHeader>
-        <ResultType>{result.type.toUpperCase()}</ResultType>
-      </ResultHeader>
+      {result.type !== 'text' ? (
+        <ResultHeader>
+          <ResultType>{result.type.toUpperCase()}</ResultType>
+        </ResultHeader>
+      ) : null}
       {renderContent()}
     </ResultContainer>
   );

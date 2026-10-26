@@ -12,6 +12,7 @@ import { SandboxManager } from './SandboxManager';
 import { EventManager } from './EventManager';
 import { AuditSystem } from './EventManager';
 import { promptRegistry } from '../PromptRegistry';
+import { devLog, devWarn } from '../../utils/devConsole';
 
 export interface SkillToolDefinition {
   type: 'function';
@@ -114,7 +115,7 @@ export class SkillTool {
   private listenPromptRegistryUpdates(): void {
     promptRegistry.on('prompt:updated', (event: { id: string }) => {
       if (event.id.startsWith('tool-')) {
-        console.log(`[SkillTool] Tool prompt '${event.id}' updated from PromptRegistry, will take effect on next use`);
+        devLog(`[SkillTool] Tool prompt '${event.id}' updated from PromptRegistry, will take effect on next use`);
       }
     });
   }
@@ -145,7 +146,7 @@ export class SkillTool {
         }
       }
     } catch (error) {
-      console.warn('Failed to scan local skills:', error);
+      devWarn('Failed to scan local skills:', error);
     }
   }
 

@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Button, Input, Switch, Typography, message as antMessage } from 'antd';
 
 import { DEFAULT_TOOL_ROUTING_COLLECTION } from '../../services/chat/ToolRoutingRecall';
+import { devWarn } from '../../utils/devConsole';
 
 const { Text, Paragraph } = Typography;
 
@@ -52,7 +53,7 @@ export default function ToolVectorRoutingPanel(props: ToolVectorRoutingPanelProp
       const r = await onSyncIndex();
       if (r.errors.length) {
         antMessage.warning(`已写入 ${r.stored} 条，部分失败见控制台`);
-        console.warn('[ToolRoutingSync]', r.errors);
+        devWarn('[ToolRoutingSync]', r.errors);
       } else {
         antMessage.success(`已同步 ${r.stored} 个技能的工具描述到 KGM`);
       }

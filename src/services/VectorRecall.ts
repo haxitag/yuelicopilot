@@ -9,6 +9,9 @@
  * 4. 返回最相关的 topN 结果
  */
 
+import { devLog, devWarn } from '../utils/devConsole';
+import { loadVectorRecallFromIdb, saveVectorRecallToIdb } from './vectorRecallStore';
+
 export interface Segment {
   id: string;
   content: string;
@@ -38,12 +41,64 @@ const DEFAULT_CONFIG: RecallConfig = {
   overlapSize: 50
 };
 
+const PERSIST_KEY = 'yueli_topic_vector_segments_v1';
+
 class VectorRecallService {
   private segments: Segment[] = [];
   private config: RecallConfig;
+  private persistTopicKey: string | null = null;
 
   constructor(config: Partial<RecallConfig> = {}) {
     this.config = { ...DEFAULT_CONFIG, ...config };
+    this.loadPersisted();
+    void this.hydrateFromIndexedDb();
+  }
+
+  private loadPersisted(): void {
+    if (typeof window === 'undefined') return;
+    try {
+      const raw = window.localStorage.getItem(PERSIST_KEY);
+      if (!raw) return;
+      const parsed = JSON.parse(raw) as { topicKey?: string; segments?: Segment[] };
+      if (parsed?.segments?.length) {
+        this.segments = parsed.segments;
+        this.persistTopicKey = parsed.topicKey ?? null;
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  private async hydrateFromIndexedDb(): Promise<void> {
+    const payload = await loadVectorRecallFromIdb();
+    if (!payload?.segments?.length) return;
+    this.segments = payload.segments;
+    this.persistTopicKey = payload.topicKey ?? null;
+  }
+
+  private persist(): void {
+    if (typeof window === 'undefined') return;
+    const payload = { topicKey: this.persistTopicKey, segments: this.segments };
+    void saveVectorRecallToIdb(payload).then((ok) => {
+      if (ok) {
+        try {
+          window.localStorage.removeItem(PERSIST_KEY);
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      try {
+        window.localStorage.setItem(PERSIST_KEY, JSON.stringify(payload));
+      } catch {
+        devWarn('[VectorRecall] 持久化失败，可能超出 localStorage / IndexedDB 配额');
+      }
+    });
+  }
+
+  /** 绑定主题后索引会写入 localStorage，重启可恢复（轻量关键词向量） */
+  setPersistTopicKey(topicKey: string | null): void {
+    this.persistTopicKey = topicKey;
   }
 
   /**
@@ -151,7 +206,7 @@ class VectorRecallService {
       }
     });
 
-    console.log(`🔪 分割完成：${files.length} 个文件 → ${segments.length} 个 segments`);
+    devLog(`🔪 分割完成：${files.length} 个文件 → ${segments.length} 个 segments`);
     return segments;
   }
 
@@ -182,9 +237,11 @@ class VectorRecallService {
   /**
    * 向量化所有 segments
    */
-  indexSegments(files: Array<{ name: string; content: string }>): void {
+  indexSegments(files: Array<{ name: string; content: string }>, topicKey?: string): void {
+    if (topicKey) this.persistTopicKey = topicKey;
     this.segments = this.splitIntoSegments(files);
-    console.log(`📊 索引完成：${this.segments.length} 个 segments`);
+    devLog(`📊 索引完成：${this.segments.length} 个 segments`);
+    this.persist();
   }
 
   /**
@@ -198,7 +255,7 @@ class VectorRecallService {
     const minSimilarity = threshold ?? this.config.threshold;
 
     if (this.segments.length === 0) {
-      console.warn('⚠️ 没有已索引的 segments');
+      devWarn('⚠️ 没有已索引的 segments');
       return [];
     }
 
@@ -206,11 +263,11 @@ class VectorRecallService {
     const queryTokens = this.tokenize(query);
     
     if (queryTokens.length === 0) {
-      console.warn('⚠️ 查询为空或无法分词');
+      devWarn('⚠️ 查询为空或无法分词');
       return [];
     }
 
-    console.log(`🔍 查询分词结果: ${queryTokens.join(', ')}`);
+    devLog(`🔍 查询分词结果: ${queryTokens.join(', ')}`);
 
     // 计算相似度
     const results: RecallResult[] = [];
@@ -232,9 +289,9 @@ class VectorRecallService {
     results.sort((a, b) => b.similarity - a.similarity);
     const topResults = results.slice(0, n);
 
-    console.log(`🔍 检索完成：查询 "${query.substring(0, 30)}..." → 找到 ${topResults.length} 个相关 segments`);
+    devLog(`🔍 检索完成：查询 "${query.substring(0, 30)}..." → 找到 ${topResults.length} 个相关 segments`);
     topResults.forEach((result, idx) => {
-      console.log(`  ${idx + 1}. [${(result.similarity * 100).toFixed(1)}%] ${result.segment.fileName}`);
+      devLog(`  ${idx + 1}. [${(result.similarity * 100).toFixed(1)}%] ${result.segment.fileName}`);
     });
 
     return topResults;
@@ -279,7 +336,11 @@ class VectorRecallService {
    */
   clear(): void {
     this.segments = [];
-    console.log('🗑️ 索引已清空');
+    this.persistTopicKey = null;
+    if (typeof window !== 'undefined') {
+      window.localStorage.removeItem(PERSIST_KEY);
+    }
+    devLog('🗑️ 索引已清空');
   }
 
   /**

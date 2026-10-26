@@ -1,0 +1,212 @@
+/**
+ * Copilot 聊天 Markdown 编辑器样式映射（对齐产品规范）
+ * 作用域：.chat-message-content .wmde-markdown
+ */
+
+.chat-message-content .wmde-markdown {
+  font-size: 14px;
+  color: #1f2937;
+  word-break: break-word;
+}
+
+/* 正文：默认字号，无额外装饰 */
+.chat-message-content .wmde-markdown p {
+  margin: 9.6px 0;
+  line-height: 1.92;
+  font-size: inherit;
+  font-weight: normal;
+}
+
+/* 一级 / 二级 / 三级标题 */
+.chat-message-content .wmde-markdown h1 {
+  font-size: 1.5em;
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 16px 0 8px;
+  color: #111827;
+  border: none;
+  padding: 0;
+}
+
+.chat-message-content .wmde-markdown h2 {
+  font-size: 1.3em;
+  font-weight: 600;
+  line-height: 1.35;
+  margin: 14px 0 6px;
+  color: #1f2937;
+  border: none;
+  padding: 0;
+}
+
+.chat-message-content .wmde-markdown h3 {
+  font-size: 1.15em;
+  font-weight: 600;
+  line-height: 1.4;
+  margin: 12px 0 4px;
+  color: #374151;
+  border: none;
+  padding: 0;
+}
+
+.chat-message-content .wmde-markdown h4,
+.chat-message-content .wmde-markdown h5,
+.chat-message-content .wmde-markdown h6 {
+  font-size: 1.05em;
+  font-weight: 600;
+  margin: 10px 0 4px;
+  color: #374151;
+}
+
+/* 加粗 */
+.chat-message-content .wmde-markdown strong,
+.chat-message-content .wmde-markdown b {
+  font-weight: 600;
+  color: inherit;
+}
+
+/* 下划线 <u> */
+.chat-message-content .wmde-markdown u {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* 无序列表 * / - */
+.chat-message-content .wmde-markdown ul {
+  margin: 9.6px 0;
+  padding-left: 1.5em;
+  list-style-type: disc;
+}
+
+.chat-message-content .wmde-markdown ul ul {
+  list-style-type: circle;
+  margin: 4px 0;
+}
+
+.chat-message-content .wmde-markdown ol {
+  margin: 9.6px 0;
+  padding-left: 1.5em;
+  list-style-type: decimal;
+}
+
+.chat-message-content .wmde-markdown li {
+  margin-bottom: 4.8px;
+  line-height: 1.92;
+}
+
+.chat-message-content .wmde-markdown li > p {
+  margin: 0.25em 0;
+}
+
+/* 任务列表 - [ ] / - [x] */
+.chat-message-content .wmde-markdown ul.contains-task-list,
+.chat-message-content .wmde-markdown ol.contains-task-list {
+  list-style: none;
+  padding-left: 0.25em;
+}
+
+.chat-message-content .wmde-markdown li.task-list-item {
+  list-style: none;
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4em;
+}
+
+.chat-message-content .wmde-markdown input[type='checkbox'] {
+  margin-top: 0.35em;
+  flex-shrink: 0;
+  accent-color: #1890ff;
+}
+
+/* 引用 */
+.chat-message-content .wmde-markdown blockquote {
+  margin: 9.6px 0;
+  padding: 8px 12px;
+  border-left: 4px solid #3b82f6;
+  background: #f8fafc;
+  color: #475569;
+}
+
+.chat-message-content .wmde-markdown blockquote p {
+  margin: 0.25em 0;
+}
+
+/* 分隔线 ------- / --- */
+.chat-message-content .wmde-markdown hr {
+  border: none;
+  border-top: 1px solid #d1d5db;
+  margin: 16px 0;
+}
+
+/* 代码块 */
+.chat-message-content .wmde-markdown pre {
+  margin: 9.6px 0;
+  padding: 12px 14px;
+  border-radius: 6px;
+  background: #f6f8fa;
+  border: 1px solid #e5e7eb;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.chat-message-content .wmde-markdown :not(pre) > code {
+  padding: 0.15em 0.35em;
+  border-radius: 4px;
+  background: #f3f4f6;
+  font-size: 0.92em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* 链接 */
+.chat-message-content .wmde-markdown a {
+  color: #2563eb;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.chat-message-content .wmde-markdown a:hover {
+  color: #1d4ed8;
+}
+
+/* 图片 */
+.chat-message-content .wmde-markdown img {
+  max-width: 100%;
+  height: auto;
+  margin: 8px 0;
+  border-radius: 4px;
+  vertical-align: middle;
+}
+
+/* 表格 */
+.chat-message-content .wmde-markdown table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 9.6px 0;
+  font-size: 14px;
+  display: table;
+}
+
+.chat-message-content .wmde-markdown th,
+.chat-message-content .wmde-markdown td {
+  border: 1px solid #d1d5db;
+  padding: 10px 12px;
+  text-align: left;
+  vertical-align: top;
+  line-height: 1.68;
+}
+
+.chat-message-content .wmde-markdown th {
+  background: #f6f6f6;
+  font-weight: 600;
+}
+
+.chat-message-content .wmde-markdown tr:nth-child(even) td {
+  background: #fafafa;
+}
+
+.chat-message-content .wmde-markdown .table-scroll-wrap {
+  overflow-x: auto;
+  margin: 9.6px 0;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+}

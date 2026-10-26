@@ -15,6 +15,7 @@ import { fileURLToPath } from 'url';
 import { EventEmitter } from 'events';
 import https from 'https';
 import http from 'http';
+import { devWarn } from '../../utils/devConsole';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -374,7 +375,7 @@ class SkillsHubSystem extends EventEmitter {
     try {
       return await this.browseHub();
     } catch (e) {
-      console.warn('[SkillsHub] browseHub 失败:', e instanceof Error ? e.message : e);
+      devWarn('[SkillsHub] browseHub 失败:', e instanceof Error ? e.message : e);
       return [];
     }
   }

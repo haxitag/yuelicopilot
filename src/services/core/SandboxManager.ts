@@ -1,5 +1,6 @@
 import { ResourceQuota, SandboxMetrics, SandboxExecutionResult, PluginStatus, AuditType } from '../../types';
 import { AuditSystem, EventManager } from './EventManager';
+import { devLog, devWarn } from '../../utils/devConsole';
 
 export interface SandboxEnvironment {
   id: string;
@@ -332,10 +333,10 @@ export class SandboxManager {
       try {
         await fs.mkdir(this.SANDBOX_BASE, { recursive: true });
       } catch (error) {
-        console.warn('Failed to create sandbox base directory:', error);
+        devWarn('Failed to create sandbox base directory:', error);
       }
     } else {
-      console.log('浏览器环境：使用虚拟沙箱路径', this.SANDBOX_BASE);
+      devLog('浏览器环境：使用虚拟沙箱路径', this.SANDBOX_BASE);
     }
   }
 
@@ -355,7 +356,7 @@ export class SandboxManager {
       await fs.mkdir(`${basePath}/lib`, { recursive: true });
       await fs.mkdir(`${basePath}/tmp`, { recursive: true });
     } else {
-      console.log(`浏览器环境：创建虚拟沙箱环境 ${envId}`);
+      devLog(`浏览器环境：创建虚拟沙箱环境 ${envId}`);
     }
 
     const env: SandboxEnvironment = {
@@ -383,16 +384,16 @@ export class SandboxManager {
   public async installDependencyInSandbox(env: SandboxEnvironment, dep: string): Promise<boolean> {
     // 检查是否在白名单中
     if (!this.ALLOWED_DEPENDENCIES.includes(dep)) {
-      console.warn(`Dependency ${dep} is not in allowed list`);
+      devWarn(`Dependency ${dep} is not in allowed list`);
       return false;
     }
 
     try {
-      console.log(`Installing ${dep} in sandbox: ${env.basePath}`);
+      devLog(`Installing ${dep} in sandbox: ${env.basePath}`);
       
       if (typeof window !== 'undefined') {
         // 浏览器环境：模拟安装
-        console.log(`浏览器环境：模拟安装依赖 ${dep}`);
+        devLog(`浏览器环境：模拟安装依赖 ${dep}`);
         return true;
       }
       
@@ -403,10 +404,10 @@ export class SandboxManager {
       let installPath: string;
       try {
         installPath = execSync(`brew --prefix ${dep}`).toString().trim();
-        console.log(`${dep} already installed at: ${installPath}`);
+        devLog(`${dep} already installed at: ${installPath}`);
       } catch {
         // 安装依赖
-        console.log(`Installing ${dep} via brew...`);
+        devLog(`Installing ${dep} via brew...`);
         execSync(`brew install ${dep}`, { stdio: 'ignore' });
         installPath = execSync(`brew --prefix ${dep}`).toString().trim();
       }
@@ -419,7 +420,7 @@ export class SandboxManager {
       await fs.copyFile(binPath, sandboxBinPath);
       await fs.chmod(sandboxBinPath, 0o755);
 
-      console.log(`Successfully installed ${dep} in sandbox`);
+      devLog(`Successfully installed ${dep} in sandbox`);
       return true;
     } catch (error) {
       console.error(`Failed to install ${dep} in sandbox:`, error);
@@ -437,13 +438,9 @@ export class SandboxManager {
     }
 
     if (typeof window !== 'undefined') {
-      // 浏览器环境：模拟执行
-      console.log(`浏览器环境：模拟执行命令 ${command}`);
-      return {
-        exitCode: 0,
-        stdout: `Simulated output for: ${command}`,
-        stderr: ''
-      };
+      throw new Error(
+        '浏览器环境无法在本机执行 shell 命令。请启动 skill-executor（server/index.js）并通过服务端 Runner 执行，或仅使用 runtime: prompt 类技能。'
+      );
     }
 
     return new Promise((resolve) => {
@@ -491,11 +488,11 @@ export class SandboxManager {
         const fs = require('fs').promises;
         await fs.rm(env.basePath, { recursive: true, force: true });
       } else {
-        console.log(`浏览器环境：清理虚拟沙箱环境 ${envId}`);
+        devLog(`浏览器环境：清理虚拟沙箱环境 ${envId}`);
       }
       this.environments.delete(envId);
     } catch (error) {
-      console.warn(`Failed to cleanup sandbox environment ${envId}:`, error);
+      devWarn(`Failed to cleanup sandbox environment ${envId}:`, error);
     }
   }
 
@@ -522,7 +519,7 @@ export class SandboxManager {
     // 检查是否已存在全局沙箱
     let globalEnv = this.environments.get(this.DEFAULT_ENV_ID);
     if (globalEnv) {
-      console.log('全局沙箱环境已存在:', this.DEFAULT_ENV_ID);
+      devLog('全局沙箱环境已存在:', this.DEFAULT_ENV_ID);
       return globalEnv;
     }
 
@@ -537,7 +534,7 @@ export class SandboxManager {
       await fs.mkdir(`${basePath}/lib`, { recursive: true });
       await fs.mkdir(`${basePath}/tmp`, { recursive: true });
     } else {
-      console.log('浏览器环境：创建虚拟全局沙箱环境');
+      devLog('浏览器环境：创建虚拟全局沙箱环境');
     }
 
     globalEnv = {
@@ -557,7 +554,7 @@ export class SandboxManager {
     }
 
     this.environments.set(this.DEFAULT_ENV_ID, globalEnv);
-    console.log('全局沙箱环境创建成功:', this.DEFAULT_ENV_ID);
+    devLog('全局沙箱环境创建成功:', this.DEFAULT_ENV_ID);
     
     return globalEnv;
   }
@@ -599,7 +596,7 @@ export class SandboxManager {
       env.registeredModules.push(module.id);
     }
 
-    console.log(`模块 ${module.id} 已注册到沙箱环境 ${module.sandboxEnvId}`);
+    devLog(`模块 ${module.id} 已注册到沙箱环境 ${module.sandboxEnvId}`);
     
     return fullModule;
   }
@@ -618,7 +615,7 @@ export class SandboxManager {
     }
 
     this.registeredModules.delete(moduleId);
-    console.log(`模块 ${moduleId} 已注销`);
+    devLog(`模块 ${moduleId} 已注销`);
   }
 
   /**

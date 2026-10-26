@@ -6,6 +6,7 @@ import {
 } from '../../types';
 import { resolveSkillExecutorAuthHeaders, resolveSkillExecutorBaseUrl } from '../../utils/skillExecutorUrl';
 import { adaptOpenCodeManifest } from './OpenCodeSkillAdapter';
+import { devLog, devWarn } from '../../utils/devConsole';
 
 export interface SkillPackage {
   id: string;
@@ -14,6 +15,12 @@ export interface SkillPackage {
   manifest: LocalSkillManifest;
   sourceType: 'agent-directory' | 'custom-directory' | 'workspace';
 }
+
+/** 选择技能根目录：优先 File System Access API，否则回退 webkitdirectory（Safari / Firefox 等） */
+export type SkillDirectoryPickResult =
+  | { ok: true; mode: 'fs'; handle: FileSystemDirectoryHandle; name: string }
+  | { ok: true; mode: 'legacy'; files: File[]; name: string }
+  | { ok: false; reason: 'cancelled' };
 
 export class LocalSkillScanner {
   private get executorUrl(): string {
@@ -43,20 +50,68 @@ export class LocalSkillScanner {
     this.initKnownDirectories();
   }
 
+  /** 规范化路径键，用于合并去重（避免同一绝对路径多次扫描） */
+  private normalizeScanPathKey(p: string): string {
+    return p.replace(/\\/g, '/').replace(/\/+/g, '/').replace(/\/+$/, '');
+  }
+
   /**
-   * 初始化已知的技能目录路径
+   * 当前工作目录下的项目级技能根（需 process.env.PWD 或 INIT_CWD，通常由 Skill Executor / Node 提供）
+   */
+  private addWorkspaceRootsFromPwd(): void {
+    let pwd = '';
+    try {
+      if (typeof process !== 'undefined' && process?.env) {
+        pwd = (process.env.PWD || process.env.INIT_CWD || '').trim();
+      }
+    } catch {
+      return;
+    }
+    if (!pwd) return;
+
+    const sep = pwd.endsWith('/') ? '' : '/';
+    const entries: Array<[LocalSkillSource['platform'], string, string]> = [
+      ['yueli', '.skills', 'Yueli Copilot 工作区 .skills'],
+      ['other', '.agents/skills', '工作区 AgentSkills (.agents/skills)'],
+      ['other', '.agent/skills', '工作区 .agent/skills'],
+      ['gemini', '.gemini/skills', '工作区 Gemini CLI skills'],
+      ['antigravity', '.gemini/antigravity/skills', '工作区 Antigravity skills'],
+      ['opencode', '.opencode/skills', '工作区 OpenCode skills'],
+      ['qoder', '.qoder/skills', '工作区 Qoder skills'],
+      ['trae', '.trae/skills', '工作区 Trae skills'],
+      ['trae', '.trae/agents', '工作区 Trae agents'],
+      ['codebuddy', '.codebuddy/skills', '工作区 CodeBuddy skills'],
+      ['codebuddy', '.codebuddy/agents', '工作区 CodeBuddy agents'],
+      ['iflow', '.iflow/skills', '工作区 iFlow skills'],
+      ['qwen', '.qwen/skills', '工作区 Qwen Code skills'],
+      ['kiro', '.kiro/skills', '工作区 Kiro skills'],
+      ['kiro', '.kiro/agents', '工作区 Kiro agents'],
+      ['roo', '.roo/skills', '工作区 Roo Code skills'],
+      ['augment', '.augment/skills', '工作区 Augment skills'],
+      ['forge', '.forge/skills', '工作区 ForgeCode skills'],
+      ['forge', '.forge/agents', '工作区 ForgeCode agents'],
+      ['cursor', '.cursor/skills', '工作区 Cursor skills'],
+      ['cursor', '.cursor/agents', '工作区 Cursor agents'],
+      ['codex', '.codex/skills', '工作区 Codex skills'],
+      ['openclaw', '.openclaw/skills', '工作区 OpenClaw skills'],
+      ['windsurf', '.windsurf/skills', '工作区 Windsurf skills'],
+      ['zed', '.zed/skills', '工作区 Zed skills（若存在）']
+    ];
+
+    for (const [platform, rel, desc] of entries) {
+      this.addKnownDirectory(`${pwd}${sep}${rel}`, platform, desc);
+    }
+  }
+
+  /**
+   * 初始化已知的技能目录路径（用户级 + 工作区级；同一路径自动去重合并）
    */
   private initKnownDirectories(): void {
     try {
+      this.addWorkspaceRootsFromPwd();
+
       const homeDir = this.getHomeDirectory();
-      
-      // ====== 工作区技能目录 (Yueli Copilot) ======
-      try {
-        if (typeof process !== 'undefined' && process?.env?.PWD) {
-          this.addKnownDirectory(`${process.env.PWD}/.skills`, 'yueli', 'Yueli Copilot 工作区技能');
-        }
-      } catch {}
-      
+
       if (homeDir) {
         // 用户 home 下通用 .skills（与项目内 .skills 并列）
         this.addKnownDirectory(`${homeDir}/.skills`, 'other', '用户主目录 .skills');
@@ -72,10 +127,47 @@ export class LocalSkillScanner {
         // Claude Code 目录
         this.addKnownDirectory(`${homeDir}/.claude/skills`, 'claude-code', 'Claude Code Skills');
         this.addKnownDirectory(`${homeDir}/.anthropic/skills`, 'claude-code', 'Anthropic Skills');
+        this.addKnownDirectory(`${homeDir}/.claude/.agent`, 'claude-code', 'Claude Code .agent');
+        this.addKnownDirectory(`${homeDir}/.claude/.skill`, 'claude-code', 'Claude Code .skill');
+        this.addKnownDirectory(`${homeDir}/.claude/agents`, 'claude-code', 'Claude Code agents');
         
         // Cursor 目录
         this.addKnownDirectory(`${homeDir}/.cursor/skills`, 'cursor', 'Cursor Skills');
         this.addKnownDirectory(`${homeDir}/.cursor/agents`, 'cursor', 'Cursor Agents');
+        this.addKnownDirectory(`${homeDir}/.cursor/.agent`, 'cursor', 'Cursor .agent');
+        this.addKnownDirectory(`${homeDir}/.cursor/.skill`, 'cursor', 'Cursor .skill');
+
+        // Windsurf（Codeium Cascade）全局技能
+        this.addKnownDirectory(`${homeDir}/.codeium/windsurf/skills`, 'windsurf', 'Windsurf 全局技能 (~/.codeium/windsurf/skills)');
+        this.addKnownDirectory(`${homeDir}/.codeium/windsurf/agents`, 'windsurf', 'Windsurf Agents');
+        this.addKnownDirectory(`${homeDir}/.windsurf/skills`, 'windsurf', 'Windsurf ~/.windsurf/skills');
+
+        // OpenClaw（AgentSkills 兼容）
+        this.addKnownDirectory(`${homeDir}/.openclaw/skills`, 'openclaw', 'OpenClaw 托管技能 (~/.openclaw/skills)');
+        this.addKnownDirectory(`${homeDir}/.openclaw/agents`, 'openclaw', 'OpenClaw Agents');
+
+        // Gemini CLI、Roo Code、Augment、Zed、ForgeCode（ForgeCode 全局为 ~/forge，见官方文档）
+        this.addKnownDirectory(`${homeDir}/.gemini/skills`, 'gemini', 'Gemini CLI 用户级 (~/.gemini/skills)');
+        this.addKnownDirectory(`${homeDir}/.roo/skills`, 'roo', 'Roo Code 全局 (~/.roo/skills)');
+        this.addKnownDirectory(`${homeDir}/.augment/skills`, 'augment', 'Augment 全局 (~/.augment/skills)');
+        this.addKnownDirectory(`${homeDir}/.config/zed/skills`, 'zed', 'Zed 全局 (~/.config/zed/skills)');
+        this.addKnownDirectory(`${homeDir}/.zed/skills`, 'zed', 'Zed 备用 (~/.zed/skills)');
+        this.addKnownDirectory(`${homeDir}/forge/skills`, 'forge', 'ForgeCode 全局技能 (~/forge/skills)');
+        this.addKnownDirectory(`${homeDir}/forge/agents`, 'forge', 'ForgeCode 全局 agents (~/forge/agents)');
+
+        // Antigravity、OpenCode、Qoder、CodeBuddy、iFlow、Qwen Code、Kiro（含 OpenCode XDG 路径）
+        this.addKnownDirectory(`${homeDir}/.gemini/antigravity/skills`, 'antigravity', 'Antigravity (~/.gemini/antigravity/skills)');
+        this.addKnownDirectory(`${homeDir}/.config/opencode/skills`, 'opencode', 'OpenCode XDG (~/.config/opencode/skills)');
+        this.addKnownDirectory(`${homeDir}/.config/opencode/agents`, 'opencode', 'OpenCode XDG agents');
+        this.addKnownDirectory(`${homeDir}/.opencode/skills`, 'opencode', 'OpenCode (~/.opencode/skills)');
+        this.addKnownDirectory(`${homeDir}/.opencode/agents`, 'opencode', 'OpenCode agents (~/.opencode/agents)');
+        this.addKnownDirectory(`${homeDir}/.qoder/skills`, 'qoder', 'Qoder (~/.qoder/skills)');
+        this.addKnownDirectory(`${homeDir}/.codebuddy/skills`, 'codebuddy', 'CodeBuddy (~/.codebuddy/skills)');
+        this.addKnownDirectory(`${homeDir}/.codebuddy/agents`, 'codebuddy', 'CodeBuddy agents (~/.codebuddy/agents)');
+        this.addKnownDirectory(`${homeDir}/.iflow/skills`, 'iflow', 'iFlow CLI (~/.iflow/skills)');
+        this.addKnownDirectory(`${homeDir}/.qwen/skills`, 'qwen', 'Qwen Code (~/.qwen/skills)');
+        this.addKnownDirectory(`${homeDir}/.kiro/skills`, 'kiro', 'Kiro CLI (~/.kiro/skills)');
+        this.addKnownDirectory(`${homeDir}/.kiro/agents`, 'kiro', 'Kiro CLI agents (~/.kiro/agents)');
         
         // Continue AI 目录
         this.addKnownDirectory(`${homeDir}/.continue/skills`, 'other', 'Continue AI Skills');
@@ -95,9 +187,6 @@ export class LocalSkillScanner {
         // Yueli Copilot 主目录
         this.addKnownDirectory(`${homeDir}/.yueli/skills`, 'yueli', 'Yueli Copilot 全局技能');
 
-        // ====== OpenCode / OpenWork 相关 ======
-        this.addKnownDirectory(`${homeDir}/.opencode/skills`, 'other', 'OpenCode Skills (.opencode/skills)');
-        
         // JetBrains AI Assistant 目录
         this.addKnownDirectory(`${homeDir}/.jetbrains/ai-assistant/skills`, 'other', 'JetBrains AI Assistant');
         
@@ -106,6 +195,9 @@ export class LocalSkillScanner {
         
         // ====== Codex & OpenAI 相关 ======
         this.addKnownDirectory(`${homeDir}/.codex/skills`, 'codex', 'OpenAI Codex Skills');
+        this.addKnownDirectory(`${homeDir}/.codex/.agent`, 'codex', 'Codex .agent');
+        this.addKnownDirectory(`${homeDir}/.codex/.skill`, 'codex', 'Codex .skill');
+        this.addKnownDirectory(`${homeDir}/.codex/agents`, 'codex', 'Codex agents');
         this.addKnownDirectory(`${homeDir}/.openai/skills`, 'codex', 'OpenAI Skills');
         this.addKnownDirectory(`${homeDir}/.openai/plugins`, 'codex', 'OpenAI Plugins');
         
@@ -134,12 +226,18 @@ export class LocalSkillScanner {
         this.addKnownDirectory(`${homeDir}/.replit/skills`, 'other', 'Replit Skills');
       }
     } catch (error) {
-      console.warn('Could not initialize skill directories:', error);
+      devWarn('Could not initialize skill directories:', error);
     }
   }
 
   private addKnownDirectory(path: string, platform: LocalSkillSource['platform'], description: string): void {
-    this.knownDirectories.push({ path, platform, description });
+    const raw = path.trim();
+    if (!raw) return;
+    const key = this.normalizeScanPathKey(raw);
+    if (this.knownDirectories.some((d) => this.normalizeScanPathKey(d.path) === key)) {
+      return;
+    }
+    this.knownDirectories.push({ path: raw, platform, description });
   }
 
   /**
@@ -179,7 +277,7 @@ export class LocalSkillScanner {
           sources.push(source);
         }
       } catch (error) {
-        console.warn(`Failed to scan directory ${dir.path}:`, error);
+        devWarn(`Failed to scan directory ${dir.path}:`, error);
       }
     }
 
@@ -244,7 +342,7 @@ export class LocalSkillScanner {
 
       return data.source as LocalSkillSource;
     } catch (error) {
-      console.warn(`Failed to scan ${directory} via Skill Executor:`, error);
+      devWarn(`Failed to scan ${directory} via Skill Executor:`, error);
       return null;
     }
   }
@@ -268,22 +366,24 @@ export class LocalSkillScanner {
       if (storedSkills) {
         const skills = JSON.parse(storedSkills);
         source.skills = skills;
-        console.log(`[LocalSkillScanner] 从 localStorage 加载了 ${skills.length} 个技能`);
+        devLog(`[LocalSkillScanner] 从 localStorage 加载了 ${skills.length} 个技能`);
       } else {
-        console.log(`[LocalSkillScanner] 未找到 ${platform} 平台的缓存技能，请先运行 skills.sh scan 安装技能`);
+        devLog(`[LocalSkillScanner] 未找到 ${platform} 平台的缓存技能，请先运行 skills.sh scan 安装技能`);
       }
     } catch (error) {
-      console.warn('Failed to scan from localStorage:', error);
+      devWarn('Failed to scan from localStorage:', error);
     }
 
     return source;
   }
 
   /**
-   * 显示目录选择对话框
+   * 选择技能根目录（Chrome/Edge 用原生目录选择；其余浏览器用文件夹上传回退）
    */
-  async showDirectoryPicker(): Promise<{ handle: any; name: string } | null> {
-    if (typeof window !== 'undefined' && 'showDirectoryPicker' in window) {
+  async pickSkillRootDirectory(): Promise<SkillDirectoryPickResult> {
+    if (typeof window === 'undefined') return { ok: false, reason: 'cancelled' };
+
+    if ('showDirectoryPicker' in window) {
       try {
         const handle = await (window as any).showDirectoryPicker({
           id: 'yueli-skill-directory-picker',
@@ -291,14 +391,168 @@ export class LocalSkillScanner {
           startIn: 'downloads',
           suggestedName: 'skills'
         });
-        
-        return { handle, name: handle.name };
-      } catch (error) {
-        console.warn('Directory picker cancelled:', error);
-        return null;
+        return { ok: true, mode: 'fs', handle, name: handle.name };
+      } catch (error: any) {
+        if (error?.name === 'AbortError') {
+          return { ok: false, reason: 'cancelled' };
+        }
+        devWarn('[LocalSkillScanner] showDirectoryPicker 失败，尝试 webkitdirectory 回退:', error);
       }
     }
-    
+
+    const files = await this.pickFolderViaWebkitDirectory();
+    if (!files?.length) return { ok: false, reason: 'cancelled' };
+    return { ok: true, mode: 'legacy', files, name: this.inferRootFolderNameFromWebkitFiles(files) };
+  }
+
+  /**
+   * @deprecated 使用 {@link pickSkillRootDirectory}，可区分取消与不支持
+   */
+  async showDirectoryPicker(): Promise<{ handle: any; name: string } | null> {
+    const r = await this.pickSkillRootDirectory();
+    if (!r.ok) return null;
+    if (r.mode === 'fs') return { handle: r.handle, name: r.name };
+    return null;
+  }
+
+  private inferRootFolderNameFromWebkitFiles(files: File[]): string {
+    const first = files[0];
+    const rel = (first as File & { webkitRelativePath?: string }).webkitRelativePath;
+    if (rel && rel.includes('/')) return rel.split('/')[0] || first.name;
+    return 'skills';
+  }
+
+  /** 通过 `<input webkitdirectory>` 选取文件夹内全部文件（无 File System Access API 时） */
+  private pickFolderViaWebkitDirectory(): Promise<File[] | null> {
+    return new Promise((resolve) => {
+      const input = document.createElement('input');
+      input.type = 'file';
+      (input as HTMLInputElement & { webkitdirectory?: boolean }).webkitdirectory = true;
+      input.multiple = true;
+      input.style.cssText = 'position:fixed;left:-9999px;width:1px;height:1px;opacity:0';
+      document.body.appendChild(input);
+
+      const finish = (files: File[] | null) => {
+        input.remove();
+        resolve(files);
+      };
+
+      input.addEventListener(
+        'change',
+        () => {
+          const list = input.files ? Array.from(input.files) : [];
+          finish(list.length ? list : null);
+        },
+        { once: true }
+      );
+
+      input.click();
+    });
+  }
+
+  /**
+   * 从 webkitdirectory 得到的扁平文件列表扫描技能（按首级子目录或根目录识别多个技能包）
+   */
+  async scanCustomDirectoryFromWebkitFiles(files: File[], directoryName: string): Promise<LocalSkillSource> {
+    const source: LocalSkillSource = {
+      directory: directoryName,
+      platform: 'custom',
+      skills: []
+    };
+
+    if (!files?.length) return source;
+
+    const groups = this.groupWebkitSkillFiles(files);
+    const skills: any[] = [];
+
+    for (const [folderKey, groupFiles] of groups) {
+      const manifestFile = this.findManifestInWebkitFileGroup(folderKey, groupFiles);
+      if (!manifestFile) continue;
+      try {
+        const manifestContent = await manifestFile.text();
+        const displayName = folderKey === '__root__' ? directoryName : folderKey;
+        const manifest = this.parseManifestContent(manifestContent, manifestFile.name, displayName);
+        const rel = (f: File) =>
+          ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).replace(/\\/g, '/');
+        const filesMap: Record<string, string> = { [manifestFile.name]: manifestContent };
+        for (const f of groupFiles) {
+          if (f === manifestFile) continue;
+          const path = rel(f);
+          const textExts = /\.(md|txt|json|yaml|yml|ts|tsx|js|jsx|mjs|cjs)$/i;
+          if (textExts.test(f.name)) {
+            try {
+              filesMap[path] = await f.text();
+            } catch {
+              /* skip binary */
+            }
+          }
+        }
+        skills.push({
+          id: manifest.id || displayName,
+          name: manifest.name || displayName,
+          path: folderKey === '__root__' ? directoryName : `${directoryName}/${folderKey}`,
+          manifest,
+          manifestFile: manifestFile.name,
+          files: filesMap
+        });
+      } catch {
+        /* skip invalid */
+      }
+    }
+
+    source.skills = skills;
+    if (skills.length > 0) {
+      this.saveLocalSkillToStorage('custom', { directory: directoryName, skills });
+    }
+    return source;
+  }
+
+  /** 按 webkitRelativePath 首段分组；单文件落在根则用 __root__ */
+  private groupWebkitSkillFiles(files: File[]): Map<string, File[]> {
+    const groups = new Map<string, File[]>();
+    const rel = (f: File) =>
+      ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).replace(/\\/g, '/');
+
+    for (const file of files) {
+      const r = rel(file);
+      const parts = r.split('/').filter(Boolean);
+      const key = parts.length <= 1 ? '__root__' : parts[0];
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(file);
+    }
+    return groups;
+  }
+
+  private findManifestInWebkitFileGroup(folderKey: string, files: File[]): File | null {
+    const rel = (f: File) =>
+      ((f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name).replace(/\\/g, '/');
+
+    for (const name of this.supportedManifestFiles) {
+      const candidates: string[] = [];
+      if (folderKey === '__root__') {
+        candidates.push(name);
+      } else {
+        candidates.push(`${folderKey}/${name}`);
+      }
+
+      for (const c of candidates) {
+        const hit = files.find((f) => rel(f) === c);
+        if (hit) return hit;
+      }
+
+      const tail = name.includes('/') ? (name.split('/').pop() as string) : name;
+      const hitEnds = files.find((f) => {
+        const r = rel(f);
+        if (folderKey === '__root__') return r === tail || r.endsWith(`/${tail}`);
+        return r === `${folderKey}/${tail}` || r.endsWith(`/${folderKey}/${tail}`);
+      });
+      if (hitEnds) return hitEnds;
+
+      if (name.includes('/')) {
+        const hitNested = files.find((f) => rel(f).endsWith(`/${name}`) || rel(f).endsWith(`/${folderKey}/${name}`));
+        if (hitNested) return hitNested;
+      }
+    }
     return null;
   }
 
@@ -313,7 +567,7 @@ export class LocalSkillScanner {
     };
 
     if (!dirHandle) {
-      console.warn('No directory handle provided');
+      devWarn('No directory handle provided');
       return source;
     }
 
@@ -576,6 +830,8 @@ export class LocalSkillScanner {
       'database': ['database', 'sql', 'db', 'query', 'table', 'schema'],
       'file': ['file', 'read', 'write', 'directory', 'folder', 'storage'],
       'web': ['web', 'http', 'api', 'server', 'client', 'request'],
+      'research': ['research', 'search', 'jina', 'duckduckgo', 'web_research', '联网'],
+      'knowledge': ['knowledge', 'rag', 'workspace', 'desktop', 'ocr', 'clipboard', '知识'],
       'productivity': ['productivity', 'tool', 'utility', 'helper', 'manager', 'organize'],
       'system': ['system', 'constraint', 'rule', 'policy', 'context', 'recall'],
       'other': []
@@ -611,7 +867,7 @@ export class LocalSkillScanner {
       
       localStorage.setItem(key, JSON.stringify(skills));
     } catch (error) {
-      console.warn('Failed to save local skill:', error);
+      devWarn('Failed to save local skill:', error);
     }
   }
 }

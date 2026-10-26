@@ -25,10 +25,15 @@
  * 3. 内置prompt可编辑但不可删除
  * 4. 支持自定义prompt增删改
  * 5. 实时热更新，无需重启
- * 6. 持久化到localStorage
+ * 6. 持久化到 IndexedDB（主存）与 localStorage（兼容/备份）
  */
 
 import { EventEmitter } from '../utils/BrowserEventEmitter';
+import {
+  loadPromptRegistryFromIndexedDb,
+  savePromptRegistryToIndexedDb
+} from './promptRegistryIndexedDb';
+import { devLog, devWarn, devError } from '../utils/devConsole';
 
 /**
  * Prompt层级定义
@@ -87,6 +92,8 @@ class PromptRegistry extends EventEmitter {
   private static instance: PromptRegistry;
   private templates: Map<string, PromptTemplate> = new Map();
   private readonly STORAGE_KEY = 'yueli_prompt_registry_v1';
+  /** IndexedDB 首次同步（含将内置模板写入库） */
+  private hydratePromise: Promise<void> | null = null;
 
   private constructor() {
     super();
@@ -107,39 +114,83 @@ class PromptRegistry extends EventEmitter {
     // 1. 注册所有内置prompt
     this.registerBuiltInPrompts();
 
-    // 2. 从localStorage加载用户自定义覆盖
+    // 2. 从 localStorage 加载覆盖（IndexedDB 在 ensureHydrated 中再对齐）
     try {
       const stored = localStorage.getItem(this.STORAGE_KEY);
       if (stored) {
         const customPrompts: PromptTemplate[] = JSON.parse(stored);
-        customPrompts.forEach(p => {
-          // 只覆盖editable的prompt
-          const existing = this.templates.get(p.id);
-          if (existing && existing.editable) {
-            this.templates.set(p.id, { ...p, builtIn: existing.builtIn });
-          } else if (!existing) {
-            // 全新的自定义prompt
-            this.templates.set(p.id, p);
-          }
-        });
+        this.applyStoredOverlay(customPrompts);
       }
     } catch (e) {
-      console.error('[PromptRegistry] 加载存储失败:', e);
+      devError('[PromptRegistry] 加载存储失败:', e);
     }
 
-    console.log('[PromptRegistry] 加载完成，共', this.templates.size, '个prompt');
+    devLog('[PromptRegistry] 加载完成，共', this.templates.size, '个prompt');
+  }
+
+  /**
+   * 与 localStorage / IndexedDB 快照相同的合并规则：仅覆盖 editable 的已有项，或追加新 id。
+   */
+  private applyStoredOverlay(stored: PromptTemplate[]): void {
+    stored.forEach((p) => {
+      const existing = this.templates.get(p.id);
+      if (existing && existing.editable) {
+        this.templates.set(p.id, { ...p, builtIn: existing.builtIn });
+      } else if (!existing) {
+        this.templates.set(p.id, p);
+      }
+    });
+  }
+
+  /**
+   * 将 Prompt 表同步到 IndexedDB（`yueli_copilot`）。
+   * - 库中无数据时：把当前内存表（内置 + localStorage 覆盖）写入数据库；
+   * - 库中已有数据时：以数据库为准重建内存表，并回写 localStorage。
+   */
+  ensureHydrated(): Promise<void> {
+    if (!this.hydratePromise) {
+      this.hydratePromise = this.runIndexedDbHydration();
+    }
+    return this.hydratePromise;
+  }
+
+  private async runIndexedDbHydration(): Promise<void> {
+    try {
+      const raw = await loadPromptRegistryFromIndexedDb();
+      if (raw) {
+        const rows: PromptTemplate[] = JSON.parse(raw);
+        this.templates.clear();
+        this.registerBuiltInPrompts();
+        this.applyStoredOverlay(rows);
+        try {
+          localStorage.setItem(this.STORAGE_KEY, JSON.stringify(Array.from(this.templates.values())));
+        } catch (e) {
+          devWarn('[PromptRegistry] 回写 localStorage 失败:', e);
+        }
+      } else {
+        await savePromptRegistryToIndexedDb(
+          JSON.stringify(Array.from(this.templates.values()))
+        );
+      }
+    } catch (e) {
+      devError('[PromptRegistry] IndexedDB 同步失败:', e);
+    }
   }
 
   /**
    * 持久化到localStorage
    */
   private save(): void {
+    const allPrompts = Array.from(this.templates.values());
+    const json = JSON.stringify(allPrompts);
     try {
-      const allPrompts = Array.from(this.templates.values());
-      localStorage.setItem(this.STORAGE_KEY, JSON.stringify(allPrompts));
+      localStorage.setItem(this.STORAGE_KEY, json);
     } catch (e) {
-      console.error('[PromptRegistry] 保存失败:', e);
+      devError('[PromptRegistry] 保存到 localStorage 失败:', e);
     }
+    void savePromptRegistryToIndexedDb(json).catch((err) => {
+      devError('[PromptRegistry] 保存到 IndexedDB 失败:', err);
+    });
   }
 
   /**
@@ -154,8 +205,8 @@ class PromptRegistry extends EventEmitter {
         layer: 'L2',
         name: '默认助手',
         description: '默认帮助型AI助手人格，擅长内容创作和长文写作',
-        systemPrompt: 'You are Yueli Copilot, an advanced AI assistant specialized in comprehensive content creation and product documentation.\n\n## Core Instructions:\n1. **Focus on the Task**: Directly address the user\'s specific request. Do NOT list or describe your available skills or capabilities.\n2. **Task Analysis**: First understand what the user needs, then execute the appropriate response.\n3. **Long-form Writing**: Craft detailed content with clear structure: introduction, body sections with headings, and conclusion.\n4. **Professional Tone**: Use persuasive yet professional language tailored to the target audience.\n5. **Structured Formatting**: Employ appropriate formatting: headings, bullet points, numbered lists for readability.\n6. **Content Adaptability**: Generate content suitable for various platforms: technical docs, marketing materials, blog posts, whitepapers.\n7. **Factual Accuracy**: Ensure all information is accurate and consistent throughout documents.\n8. **Complete Responses**: Always provide complete, thorough answers rather than brief summaries.\n\n## Workflow:\n1. Analyze the user\'s input and understand the goal\n2. Break down the problem if necessary\n3. Organize information logically\n4. Create comprehensive content directly\n5. Do NOT mention your skills or tools unless explicitly asked.\n\n## Key Capabilities (Internal Reference Only):\n- Long-form content creation\n- Technical documentation\n- Product introductions\n- Data analysis and insights\n- Translation services\n- Content summarization\n\n**Important**: You are NOT required to use or mention all capabilities. Focus only on what the user specifically requests.',
-        version: '1.0.0',
+        systemPrompt: 'You are Yueli Copilot, an advanced AI assistant specialized in comprehensive content creation and product documentation.\n\n## Core Instructions:\n1. **Focus on the Task**: Directly address the user\'s specific request. Do NOT list or describe your available skills or capabilities.\n2. **Answer-first delivery**: Lead with the usable answer in the user\'s primary language for this turn (match Chinese-heavy prompts with concise Simplified Chinese; match all-English prompts with English).\n3. **Long-form Writing**: When the task warrants it, craft detailed content with clear structure: introduction, body sections with headings, and conclusion.\n4. **Professional Tone**: Use persuasive yet professional language tailored to the target audience.\n5. **Structured Formatting**: Employ headings, bullet points, and numbered lists for readability.\n6. **Content Adaptability**: Generate content suitable for various platforms: technical docs, marketing materials, blog posts, whitepapers.\n7. **Factual Accuracy**: Ensure all information is accurate and consistent throughout documents.\n8. **Complete Responses**: Prefer complete answers over hollow process narration; if constrained, explain the limitation briefly and still deliver partial value.\n\n## User-visible output rules (paired with Chinese `system-core`)\n- Do NOT begin the assistant\'s visible reply with `Thinking Process:`, `### Analyzing`, `Let me think step by step`, or long numbered English diagnostic scaffolds, unless the user explicitly asks for chain-of-thought.\n- Keep an internal mini-loop implicit: clarify goal → briefly plan → use tools/context → mental self-check → output the deliverable—not a transcript of brainstorming.\n\n## Workflow:\n1. Parse the goal and implicit success criteria from the latest user messages.\n2. Pull facts from provided project/KB context and call tools before stating uncertain external facts.\n3. Mental self-check before send: answered the literal request? conflicts with cited facts? if unknown, admit uncertainty rather than inventing.\n4. Write the final user-facing reply (not a narration of analyzing this system prompt).\n\n## Key Capabilities (Internal Reference Only):\n- Long-form content creation\n- Technical documentation\n- Product introductions\n- Data analysis and insights\n- Translation services\n- Content summarization\n\n**Important**: You are NOT required to use or mention all capabilities. Focus only on what the user specifically requests.',
+        version: '1.1.0',
         editable: true,
         builtIn: true,
         createdAt: new Date().toISOString(),
@@ -485,8 +536,8 @@ class PromptRegistry extends EventEmitter {
         layer: 'L1',
         name: '核心系统配置',
         description: 'Yueli Copilot核心系统prompt，定义AI助手的基本职责和行为规则',
-        systemPrompt: '你是一个专业的AI助手，名为Yueli Copilot。你的职责是：\n1. 准确理解用户的问题和需求\n2. 提供清晰、有条理的回答\n3. 在适当时候使用代码块、列表等格式化输出\n4. 保持友好、专业的态度\n5. 如果不确定答案，请诚实告知用户\n6. 当有工具可用时，主动调用工具来完成任务\n\n## 内容引用规则\n1. 当你收到项目文件或知识库内容时，必须将内容直接整合到回答中\n2. 不要在回答中输出文件引用标记（如 [文件名]、TEXT、文件列表等）\n3. 不要在文章正文中显示文件引用卡片或标记\n4. 所有引用的信息应自然融入文章内容，确保文字连贯、可读、无歧义\n5. 如果需要标注来源，可以在文末以附录或引用列表形式补充',
-        version: '1.0.0',
+        systemPrompt: '你是一个专业的AI助手，名为Yueli Copilot。你的职责是：\n1. 准确理解用户的问题和需求\n2. 提供清晰、有条理的回答\n3. 在适当时候使用代码块、列表等格式化输出\n4. 保持友好、专业的态度\n5. 如果不确定答案，请诚实告知用户\n6. 当有工具可用时，主动调用工具来完成任务\n\n## 内容引用规则\n1. 当你收到项目文件或知识库内容时，必须将内容直接整合到回答中\n2. 不要在回答中输出文件引用标记（如 [文件名]、TEXT、文件列表等）\n3. 不要在文章正文中显示文件引用卡片或标记\n4. 所有引用的信息应自然融入文章内容，确保文字连贯、可读、无歧义\n5. 如果需要标注来源，可以在文末以附录或引用列表形式补充\n\n## 事实性、模型身份与产品范围（必须遵守）\n1. **禁止编造**自己由哪一家商业大模型「固定托管」或等价于 Claude / ChatGPT 网页版 / Kimi 等。**实际推理模型**以用户在 Copilot 内选择的 **Provider / Model**（界面角标 `provider:model` 或 **输入区底栏 `+` →「模型」**）及当次 HTTP 请求为准；若用户或上下文中未写明具体名称，应如实说明「由当前会话所选 provider/model 与 KGM/直连路由决定」，**不得臆测**厂商或版本。\n2. Yueli Copilot 是围绕 **Yueli-KGM-Computing（KGM）** 的本地/私有化工作台（聊天内做 KGM、技能、知识库等）；**不是**通用 SaaS 聊天网页壳。与本条冲突的表述以本条为准。\n3. 介绍 **Skills 勾选、Hub/GitHub 安装、API/基址配置** 等时，仅允许使用**本对话已给出的界面文案或项目文档中的明确步骤**；未给出依据时须说「请以界面与仓库根目录《工作台使用与配置指南》为准」，**禁止编造**口令、未文档化的 URL 或内部菜单。\n\n## 应答与自检协议（与用户可见输出绑定）\n**层级说明**：在上文事实与产品约束不变的前提下，本节约束你如何内化推理并只对用户产出**最终答复**。\n\n### 可见输出契约\n1. **语言**：默认与用户本轮主要用语一致（用户中文为主→简体中文；用户全文英文→英文）。\n2. **禁止过程稿顶替正文**：不得以 `Thinking Process:`、`### Analyzing`、`Let me think step by step`、长串英文条目式诊断（例如「1. **Analyze …** …」）作为对用户可见正文的开头或主体结构，除非用户明确要求展示推理链。\n3. **可交付**：对用户可见的最终消息须包含独立完成任务的结论、步骤或可阅读成品；不能只复述 System Prompt、Skills，或叙述「我正在解析提示」。\n\n### 内化循环（OODA 精简）\n每轮内化：理解意图与隐含验收→（必要时简短规划）→ 结合项目/知识与工具→ 自检→ 输出。以下通常在脑中自检即可，除非你被要求写出推导：\n- 是否回答了用户字面或真实意图；是否与已给出的文件或事实冲突。\n- 信息不足时是明确「不确定」还是擅自补全。**禁止捏造**。\n\n### 工具与降级\n需要外部事实或可执行操作时，有可用的检索/执行类工具则**先工具后结论**；工具不可用或失败时，说明边界并给出仍力所能及的最小可用方案。\n\n## Markdown 输出格式（必须遵守）\n1. 标题：`##` / `###` 的 `#` 后必须有空格（正确：`## 标题`；错误：`##一`、`--##一`）。\n2. 标题、分隔线 `---`、表格、列表项须**独占一行**，禁止与段落粘在同一行。\n3. 表格须表头行、`| --- |` 分隔行、数据行各占一行。\n4. 禁止 `###结论>`、行内长串 `----------` 代替分隔线。\n5. 总结多段材料时用空行与二级标题分段，不要输出无换行的「文字墙」。\n',
+        version: '1.1.0',
         editable: true,
         builtIn: true,
         createdAt: new Date().toISOString(),

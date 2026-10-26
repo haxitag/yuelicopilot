@@ -141,35 +141,41 @@ export async function runPreflightWithCache(
   }
 
   const strict = manifestNeedsStrictPreflight(manifest);
+  const healthy = await isSkillExecutorHealthy();
   let checks: PreflightCheckRow[];
   let ok: boolean;
 
-  if (strict) {
-    const healthy = await isSkillExecutorHealthy();
-    if (!healthy) {
-      checks = [
-        {
-          name: 'skill_executor',
-          ok: false,
-          detail:
-            '技能声明了运行环境 / 系统依赖 / 环境变量 / npm 依赖 / 联网域名等，需要本地 skill-executor 在线完成预检（默认端口 3010，可由 SKILL_EXECUTOR_PORT / VITE_SKILL_EXECUTOR_* 覆盖）。请启动 server/index.js 或在设置中配置 skillExecutorUrl。'
-        }
-      ];
-      ok = false;
-    } else {
-      checks = await fetchPreflightFromExecutor(manifest);
-      ok = checks.length > 0 && checks.every((c) => c.ok);
-    }
+  if (healthy) {
+    checks = await fetchPreflightFromExecutor(manifest);
+    ok = checks.length > 0 && checks.every((c) => c.ok);
+  } else if (strict) {
+    checks = [
+      {
+        name: 'skill_executor',
+        ok: false,
+        detail:
+          '技能声明了运行环境 / 系统依赖 / 环境变量 / npm 依赖 / 联网域名等，需要本地 skill-executor 在线完成预检（默认端口 3010，可由 SKILL_EXECUTOR_PORT / VITE_SKILL_EXECUTOR_* 覆盖）。请启动 server/index.js 或在设置中配置 skillExecutorUrl。'
+      }
+    ];
+    ok = false;
   } else {
     checks = [
       {
-        name: 'preflight',
+        name: 'manifest',
         ok: true,
-        detail: '未声明需服务端校验的硬依赖（runtime/env/system/npm/联网域名），跳过深度预检',
+        detail: 'prompt/轻量技能：executor 离线，仅通过本地 manifest 校验',
         skipped: true
+      },
+      {
+        name: 'runtime',
+        ok: manifest.runtime?.type === 'prompt' || !manifest.runtime?.entrypoint,
+        detail:
+          manifest.runtime?.type === 'prompt'
+            ? 'prompt 运行时，无需代码沙箱'
+            : '未连接 executor；启用前请启动 skill-executor 以完成完整预检'
       }
     ];
-    ok = true;
+    ok = checks.every((c) => c.ok || c.skipped);
   }
 
   const result: PreflightResult = {

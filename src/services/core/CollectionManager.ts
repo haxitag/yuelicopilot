@@ -196,6 +196,8 @@ export class CollectionManager {
       'database': '数据库操作',
       'file': '文件处理',
       'web': '网页与API',
+      'research': '联网研究',
+      'knowledge': '桌面知识',
       'productivity': '生产力工具',
       'system': '系统约束',
       'other': '其他'
@@ -215,6 +217,8 @@ export class CollectionManager {
       'database': '🗄️',
       'file': '📁',
       'web': '🌐',
+      'research': '🔍',
+      'knowledge': '📚',
       'productivity': '⚡',
       'system': '🔒',
       'other': '📦'

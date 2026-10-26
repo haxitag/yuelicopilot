@@ -43,7 +43,7 @@ export default function ExecutionTimelineView(props: { items: ExecutionTimelineI
   if (!items.length) return null;
 
   return (
-    <div style={{ marginTop: 10 }}>
+    <div style={{ marginTop: 10, minWidth: 0, maxWidth: '100%' }}>
       <Collapse
         size="small"
         items={[

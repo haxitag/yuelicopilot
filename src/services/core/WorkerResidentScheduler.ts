@@ -9,6 +9,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { EventEmitter } from 'events';
 import cron from 'node-cron';
+import { devLog } from '../../utils/devConsole';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -281,7 +282,7 @@ class WorkerResidentScheduler extends EventEmitter {
     if (!task) return null;
 
     if (this.runningTasks.has(taskId) && !manualTrigger) {
-      console.log(`[WorkerResidentScheduler] Task ${task.name} is already running, skipping`);
+      devLog(`[WorkerResidentScheduler] Task ${task.name} is already running, skipping`);
       return null;
     }
 
@@ -359,7 +360,7 @@ class WorkerResidentScheduler extends EventEmitter {
       if (attempt < maxRetries) {
         const delay = task.retryPolicy.retryDelayMs * 
           Math.pow(task.retryPolicy.backoffMultiplier, attempt);
-        console.log(`[WorkerResidentScheduler] Task ${task.name} failed, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
+        devLog(`[WorkerResidentScheduler] Task ${task.name} failed, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, delay));
       }
     }
@@ -398,7 +399,7 @@ class WorkerResidentScheduler extends EventEmitter {
       switch (channel) {
         case 'log':
           if (result.success) {
-            console.log(`[WorkerResidentScheduler] Task ${task.name} succeeded:`, result.output);
+            devLog(`[WorkerResidentScheduler] Task ${task.name} succeeded:`, result.output);
           } else {
             console.error(`[WorkerResidentScheduler] Task ${task.name} failed:`, result.error);
           }
@@ -490,7 +491,7 @@ class WorkerResidentScheduler extends EventEmitter {
       }
     }
 
-    console.log(`[WorkerResidentScheduler] Started ${this.cronJobs.size} worker tasks`);
+    devLog(`[WorkerResidentScheduler] Started ${this.cronJobs.size} worker tasks`);
     this.emit('scheduler:started');
   }
 
@@ -503,7 +504,7 @@ class WorkerResidentScheduler extends EventEmitter {
     this.cronJobs.clear();
     this.isRunning = false;
 
-    console.log('[WorkerResidentScheduler] Stopped all worker tasks');
+    devLog('[WorkerResidentScheduler] Stopped all worker tasks');
     this.emit('scheduler:stopped');
   }
 }

@@ -90,9 +90,20 @@ Yueli Copilot 是围绕 **Yueli-KGM-Computing（KGM：Knowledge Generation Model
 
 **说明**：主仓 README 中上图使用相对路径 `./xxx.png`，在 GitHub 浏览本仓库时可直接渲染。同步到 [`haxitag/yuelicopilot`](https://github.com/haxitag/yuelicopilot) 时，`scripts/oss-export.sh` 会把上述链接改写为 `https://raw.githubusercontent.com/haxitag/yuelicopilot/main/…`，避免在部分页面下相对路径或 blob 链裂图。首图文件名为 **`workbench-api.png`**（原 `ui.png` 在 GitHub README 代理下曾出现仅该资源不显示，故改名）。
 
+## 部署模式
+
+| 模式 | 入口 | 说明 |
+|------|------|------|
+| **server**（默认） | `./start.sh` 或 `npm start` | 三进程 + Vite dev；编排逻辑在 `packages/runtime-core/` |
+| **desktop** | `./start-desktop.sh` 或 `npm run start:desktop` | Gateway + `dist/`（`/kgm`、`/api` 同源）；需先 `npm run build:desktop` |
+| **desktop → Mac App** | `npm run electron:dev` / `npm run release:mac` | Electron + 签名公证 DMG，见 [Mac-App构建指南.md](./docs/Mac-App构建指南.md) |
+| **server 生产（Nginx）** | [deploy/README.md](./deploy/README.md) | 静态 `dist` + 反代 `/kgm` `/api`，与 Gateway 路由一致 |
+
+环境变量：`YUELI_DEPLOY_PROFILE=server|desktop`、`YUELI_DATA_HOME`、`YUELI_APP_ROOT`。
+
 ## 五分钟上手
 
-默认 **无需再克隆 KGM 源码仓库**：`npm install` 会安装 [`@haxitag/yueli-kgm-computing`](https://www.npmjs.com/package/@haxitag/yueli-kgm-computing)，`start.sh` 从本仓库的 `node_modules` 启动 KGM（含 Playground）。
+默认 **无需再克隆 KGM 源码仓库**：`npm install` 会安装 [`@haxitag/yueli-kgm-computing`](https://www.npmjs.com/package/@haxitag/yueli-kgm-computing)，`start.sh` 调用 `packages/runtime-core` 从本仓库的 `node_modules` 启动 KGM（含 Playground）。
 
 ```bash
 git clone https://github.com/zhyr/yuelicopilot.git
@@ -104,6 +115,10 @@ chmod +x start.sh
 ```
 
 终端会打印 **前端 / Skill Executor / KGM** 三个地址；浏览器打开 **前端 URL**（默认多为 `http://localhost:3020`）。设置里 KGM 基址应与 `.env.local` 中的 `VITE_KGM_BASE_URL` 一致，脚本已自动生成时 **一般不必手改**。
+
+### 界面操作、切换模型与配置入口
+
+与真实 UI 对齐的说明（供使用、调试与需求对齐；开源发布若不包含 `docs/` 时以根目录该文件为准）见：**[工作台使用与配置指南.md](./工作台使用与配置指南.md)**。
 
 ### 与 KGM 的版本对应
 

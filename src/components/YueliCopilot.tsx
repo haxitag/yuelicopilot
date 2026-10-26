@@ -4,6 +4,7 @@ import { useNavigate } from 'react-router-dom';
 import { useChat } from '../contexts/ChatContext';
 import { useSystemState } from '../contexts/SystemStateContext';
 import { toast } from 'react-hot-toast';
+import { devLog, devWarn, devDebug, devError } from '../utils/devConsole';
 import {
   SettingOutlined,
   DatabaseOutlined,
@@ -16,10 +17,50 @@ import ChatMessageRenderer from './ChatMessageRenderer';
 import TypewriterRenderer from './TypewriterRenderer';
 import ApiConfigModal from './ApiConfigModal';
 import KnowledgeSelectionModal from './KnowledgeSelectionModal';
+import ChatDocumentsModal from './ChatDocumentsModal';
+import { appendSessionMemoryTurn } from '../services/documents/documentServerStore';
 import { Popover, Badge } from 'antd';
 import ToolsMenu from './chat/ToolsMenu';
-import { resolveModelOptionsFromCloudConfig, safeParseCloudConfig, type ChatProvider } from '../services/chat/ModelOptions';
+import { ChatVoiceMicButton } from './chat/ChatVoiceMicButton';
+import { loadChatCloudConfigFromLocalStorage, resolveModelOptionsFromCloudConfig, type ChatProvider } from '../services/chat/ModelOptions';
+import {
+  buildTieredModelOptions,
+  type TieredModelOption
+} from '../services/chat/inferenceModelTiers';
+import { buildRouteTrace } from '../services/chat/InferenceRouter';
+import type { InferenceRoutePlan } from '../services/chat/InferenceRouter';
+import { buildChatMessages } from '../services/chat/ContextAssembler';
+import { useChatRoutePlan } from '../hooks/useChatRoutePlan';
+import SkillRoundPlanPanel from './chat/SkillRoundPlanPanel';
+import ContextBudgetPanel from './chat/ContextBudgetPanel';
+import { isSkillEvolutionEnabled } from '../services/chat/skillEvolutionPrefs';
+import {
+  fetchKgmModelCatalog,
+  pickAttachmentChatModel,
+  type KgmCatalogEntry
+} from '../services/chat/kgmModelCatalog';
+import {
+  composeAdminManagementAssistantText,
+  parseAdminManagementInput
+} from '../services/chat/adminManagementGate';
 import { createInitialStreamReducerState, normalizeRawStreamEvent, reduceStreamEvent } from '../services/chat/StreamEventReducer';
+import {
+  finalizeKgmAssistantMarkdownIfNeeded,
+  normalizeBotMessagesForDisplay,
+  pickAssistantVisibleRawText
+} from '../services/chat/kgmAssistantContent';
+import {
+  migrateSessionMessagesInLocalStorage,
+  persistNormalizedSessionMessages
+} from '../services/chat/sessionMessagesMigration';
+import { appendMarkdownOutputRules } from '../services/chat/markdownOutputRules';
+import { resolveSkillExecutorBaseUrl } from '../utils/skillExecutorUrl';
+import { pickChatFilesViaDesktop } from '../utils/desktopFilePicker';
+import {
+  extractTextFromChatFiles,
+  userInputHasAttachmentPayload,
+  formatUserMessageWithAttachments
+} from '../utils/chatFilePromptText';
 import PermissionRequestModal, { type PermissionDecision } from './chat/PermissionRequestModal';
 import SkillScriptConsentModal from './chat/SkillScriptConsentModal';
 import {
@@ -38,8 +79,25 @@ import {
   PermissionAuditEntry
 } from '../types';
 import apiService from '../api/services/apiService';
+import { ingestPdfAttachmentsForChat } from '../services/documents/pdfIngestPipeline';
+import { orchestratorPdfSkillResultsToRoleOutputs } from '../services/documents/pdfOrchestratorIntegration';
+import { runPdfOrchestratorRoleStage } from '../services/documents/pdfOrchestratorRoles';
+import {
+  readPdfAttachmentChatMode,
+  readPdfPipelineMode,
+  buildAttachmentChatPromptForLlm
+} from '../services/documents/pdfPipelineConfig';
+import {
+  buildDocumentFollowUpPrompt,
+  collectSessionDocumentIds
+} from '../services/documents/pdfFollowUp';
 import { readOpenAiStreamIncludeUsagePreference } from '../api/services/streamRequestOptions';
-import { readKnowledgeScopeMode, KNOWLEDGE_SCOPE_LS_KEY, type KnowledgeScopeMode } from '../services/chat/KnowledgeScope';
+import {
+  readKnowledgeScopeMode,
+  KNOWLEDGE_SCOPE_LS_KEY,
+  DEFAULT_KNOWLEDGE_SCOPE_MODE,
+  type KnowledgeScopeMode
+} from '../services/chat/KnowledgeScope';
 import { getDefaultOrchestrator } from '../services/core';
 import { personalitySystem } from '../services/core/PersonalitySystem';
 import PromptRegistry from '../services/PromptRegistry';
@@ -51,17 +109,44 @@ import {
   stripFileContent,
   persistTopicsToStorage as persistTopicsToStorageImpl
 } from '../services/TopicFilesStore';
+import { buildDesktopFusionContext } from '../services/desktopKnowledge/desktopFusionPrompt';
+import {
+  resolveTopicFromList,
+  clearLegacyWorkspaceLocalStorage
+} from '../services/desktopKnowledge/topicWorkspace';
 
 /**
  * 持久化 topics：先把每个 topic 的文件内容写入 IndexedDB，
  * 再把不含 content 的轻量副本写入 localStorage，避免 QuotaExceededError。
  */
+async function fetchTopicFusionContext(
+  selectedTopic: any,
+  topics: any[],
+  query: string,
+  sessionId: string,
+  recentMessages: Message[],
+  activeSkillIds?: string[]
+): Promise<{ freshTopic: any; topicFusionContext?: string }> {
+  const freshTopic = resolveTopicFromList(selectedTopic, topics) ?? selectedTopic;
+  if (!freshTopic?.workspaceLastScanAt) {
+    return { freshTopic };
+  }
+  const ctx = await buildDesktopFusionContext({
+    query,
+    sessionId,
+    documentIds: collectSessionDocumentIds(recentMessages),
+    topic: freshTopic,
+    includeWeb: activeSkillIds?.includes('desktop-knowledge-agent')
+  });
+  return { freshTopic, topicFusionContext: ctx ?? undefined };
+}
+
 async function persistTopicsToStorage(updated: any[]): Promise<void> {
   return persistTopicsToStorageImpl(updated, (err: any) => {
     if (err?.name === 'QuotaExceededError' || /quota/i.test(String(err?.message || ''))) {
       toast.error('保存项目主题失败：浏览器存储已满。文件内容已落到本地数据库，请删除无用主题后重试');
     } else {
-      console.error('persistTopicsToStorage failed:', err);
+      devError('persistTopicsToStorage failed:', err);
     }
   });
 }
@@ -71,6 +156,7 @@ function extractInvocationMetrics(
     | undefined
     | {
         invocation?: MessageMetrics;
+        transportMeta?: { fallback?: string };
         generationInfo?: {
           usage?: {
             prompt_tokens?: number;
@@ -78,7 +164,8 @@ function extractInvocationMetrics(
             total_tokens?: number;
           };
         };
-      }
+      },
+  routePlan?: InferenceRoutePlan
 ): MessageMetrics | undefined {
   if (!res || typeof res !== 'object') return undefined;
   const inv = (res as { invocation?: MessageMetrics }).invocation;
@@ -110,6 +197,14 @@ function extractInvocationMetrics(
   if (typeof pt === 'number' && Number.isFinite(pt)) metrics.promptTokens = pt;
   if (typeof ct === 'number' && Number.isFinite(ct)) metrics.completionTokens = ct;
   if (typeof tt === 'number' && Number.isFinite(tt)) metrics.totalTokens = tt;
+
+  if (routePlan) {
+    const fallback =
+      typeof (res as { transportMeta?: { fallback?: string } })?.transportMeta?.fallback === 'string'
+        ? (res as { transportMeta?: { fallback?: string } }).transportMeta!.fallback
+        : undefined;
+    metrics.routeTrace = buildRouteTrace(routePlan, fallback ? { transportFallback: fallback } : undefined);
+  }
 
   return Object.keys(metrics).length > 0 ? metrics : undefined;
 }
@@ -224,348 +319,7 @@ const lightTheme = {
   warning: '#faad14'
 };
 
-// 从PromptRegistry获取核心系统prompt
-const getSystemPrompt = (): string => {
-  try {
-    const promptRegistry = PromptRegistry.getInstance();
-    const systemCorePrompt = promptRegistry.getPrompt('system-core');
-    return systemCorePrompt?.systemPrompt || DEFAULT_SYSTEM_PROMPT;
-  } catch (e) {
-    console.warn('[YueliCopilot] 获取系统prompt失败，使用默认值');
-    return DEFAULT_SYSTEM_PROMPT;
-  }
-};
-
-// 默认系统prompt（备用）
-const DEFAULT_SYSTEM_PROMPT = `你是一个专业的AI助手，名为Yueli Copilot。你的职责是：
-1. 准确理解用户的问题和需求
-2. 提供清晰、有条理的回答
-3. 在适当时候使用代码块、列表等格式化输出
-4. 保持友好、专业的态度
-5. 如果不确定答案，请诚实告知用户
-6. 当有工具可用时，主动调用工具来完成任务
-
-## 内容引用规则
-1. 当你收到项目文件或知识库内容时，必须将内容直接整合到回答中
-2. 不要在回答中输出文件引用标记（如 [文件名]、TEXT、文件列表等）
-3. 不要在文章正文中显示文件引用卡片或标记
-4. 所有引用的信息应自然融入文章内容，确保文字连贯、可读、无歧义
-5. 如果需要标注来源，可以在文末以附录或引用列表形式补充`;
-
-/**
- * 构建完整的 API messages 数组
- * 修复：正确注入知识库、项目主题文件内容、指令全文、完整历史、技能systemPrompt
- * P1-3: 添加系统提示长度限制，防止超出 LLM 上下文限制
- */
-const buildMessages = (
-  userInput: string,
-  selectedTopic: any,
-  recentMessages: Message[],
-  instructions: any[],
-  knowledgeItems?: Array<{ id: string; name: string; content: string; type: string }>,
-  selectedSkillIds?: string[],
-  skillConfigs?: Map<string, any>,
-  selectedPrompts?: any[],
-  personalityPrompt?: string,  // 新增：人格层systemPrompt
-  userQuery?: string,  // 新增：用户输入，用于向量召回
-  /** 来自 ChatContext.processWithOrchestrator 的 KGM 知识库向量片段（与 knowledgeItems 全量注入二选一由策略决定） */
-  knowledgeRagContext?: string
-): any[] => {
-  // P1-3: 配置参数
-  const MAX_TOTAL_CHARS = 30000;  // 总字符限制（约 7500 tokens）
-  const MAX_HISTORY_MESSAGES = 10;  // 最大历史消息数
-  
-  // P1-3: 计算预估 token 数（简单估算：1 token ≈ 4 字符）
-  const estimateTokens = (text: string): number => Math.ceil((text || '').length / 4);
-  
-  // P1-3: 截断文本并添加标记
-  const truncateText = (text: string, maxChars: number, prefix: string = ''): string => {
-    if (!text || text.length <= maxChars) return text;
-    const truncated = text.substring(0, maxChars);
-    return `${prefix}${truncated}\n\n[内容已被截断，原长度约 ${estimateTokens(text)} tokens]`;
-  };
-  
-  const messages: any[] = [];
-  let totalChars = 0;
-
-  // ── 1. System Prompt（含项目主题完整信息）──
-  // 从PromptRegistry动态获取系统prompt，支持管理界面配置
-  let systemContent = getSystemPrompt();
-
-  if (selectedTopic) {
-    systemContent += `\n\n## 当前项目主题\n`;
-    systemContent += `名称: ${selectedTopic.name}\n`;
-    if (selectedTopic.description) systemContent += `描述: ${selectedTopic.description}\n`;
-
-    // 使用向量召回检索相关文件内容（只召回最相关的5个segments）
-    const hasFilesWithContent = selectedTopic.files?.some((f: any) => f.content && f.content.trim().length > 0);
-    
-    if (hasFilesWithContent && userQuery) {
-      if (import.meta.env.DEV) {
-        console.log('🔍 开始向量召回...');
-      }
-      
-      // 准备文件数据
-      const filesForRecall = selectedTopic.files
-        .filter((f: any) => f.content && f.content.trim().length > 0)
-        .map((f: any) => ({
-          name: f.name,
-          content: f.content
-        }));
-
-      // 索引文件并检索
-      vectorRecallService.indexSegments(filesForRecall);
-      const relevantFiles = vectorRecallService.recallMergedContent(userInput, 5, 0.5);
-      
-      if (relevantFiles.length > 0) {
-        systemContent += `\n### 相关文档内容（向量召回）\n`;
-        systemContent += `根据您的查询，以下是最相关的文档内容：\n\n`;
-        
-        relevantFiles.forEach((file: any, index: number) => {
-          systemContent += `---\n`;
-          systemContent += `**${index + 1}. ${file.name}**\n`;
-          systemContent += `\`\`\`\n${file.content}\n\`\`\`\n`;
-        });
-        
-        systemContent += `\n> 注：以上内容基于语义相似度从 ${selectedTopic.files.length} 个文件中检索得出\n`;
-      } else {
-        systemContent += `\n### 项目文件内容\n`;
-        selectedTopic.files.forEach((f: any) => {
-          systemContent += `\n**${f.name}**\n`;
-          if (f.content) {
-            systemContent += `\`\`\`\n${f.content}\n\`\`\`\n`;
-          } else {
-            systemContent += `(文件内容未加载)\n`;
-          }
-        });
-      }
-    } else if (selectedTopic.files && selectedTopic.files.length > 0) {
-      // 没有用户输入或没有文件内容，直接注入全部文件
-      systemContent += `\n### 项目文件内容\n`;
-      selectedTopic.files.forEach((f: any) => {
-        systemContent += `\n**${f.name}**\n`;
-        if (f.content) {
-          systemContent += `\`\`\`\n${f.content}\n\`\`\`\n`;
-        } else {
-          systemContent += `(文件内容未加载)\n`;
-        }
-      });
-    }
-    
-    // 添加强调：必须严格基于项目上下文回答
-    systemContent += `\n\n## 重要指示\n`;
-    systemContent += `1. 你的所有回答必须严格基于上面提供的项目文件内容\n`;
-    systemContent += `2. 如果项目文件中有定义或说明，请优先使用项目文件中的内容\n`;
-    systemContent += `3. 当用户询问产品定义、产品信息时，直接使用项目文件中的内容\n`;
-    systemContent += `4. 不要编造或使用与项目文件内容不符的信息\n`;
-    systemContent += `5. 如果项目文件中有事实信息，请始终遵循这些事实\n`;
-  }
-
-  // ── 2. 知识库注入（策略：全量 / 仅向量片段 / 关闭）──
-  let knowledgeScope: KnowledgeScopeMode = 'full';
-  try {
-    knowledgeScope = readKnowledgeScopeMode();
-  } catch {
-    knowledgeScope = 'full';
-  }
-
-  if (knowledgeScope !== 'off' && knowledgeItems && knowledgeItems.length > 0) {
-    const rules =
-      `\n## 知识库使用规则\n` +
-      `1. 知识库中的内容是权威的事实信息\n` +
-      `2. 当回答涉及知识库内容时，必须严格遵循知识库中的信息\n` +
-      `3. 不要编造或改变知识库中的事实\n` +
-      `4. 如果用户询问的内容在知识库中有，请直接引用\n`;
-
-    if (knowledgeScope === 'vector' && knowledgeRagContext && knowledgeRagContext.trim().length > 0) {
-      systemContent += `\n\n## 知识库上下文（向量召回）\n${knowledgeRagContext.trim()}${rules}`;
-    } else {
-      if (knowledgeScope === 'vector' && (!knowledgeRagContext || !knowledgeRagContext.trim())) {
-        systemContent += `\n\n## 知识库上下文\n`;
-        systemContent += `（已选择「仅向量召回」，但本次召回无结果或 KGM 检索不可用，已回退为全量条目注入。）\n`;
-      } else {
-        systemContent += `\n\n## 知识库上下文\n`;
-      }
-      knowledgeItems.forEach(item => {
-        systemContent += `\n### ${item.name} (${item.type})\n${item.content}\n`;
-      });
-      systemContent += rules;
-    }
-  }
-
-  messages.push({ role: 'system', content: systemContent });
-
-  // ── 2. L2 人格层 - 角色定义 ──
-  if (personalityPrompt) {
-    messages.push({
-      role: 'system',
-      content: `## 角色定义\n\n${personalityPrompt}`
-    });
-  }
-
-  // ── 3. L3 策略层 - 思考框架、分析方法 ──
-  if (selectedPrompts && selectedPrompts.length > 0) {
-    const strategyPrompts = selectedPrompts.filter(p => p.layer === 'L3');
-    if (strategyPrompts.length > 0) {
-      const strategyContent = strategyPrompts
-        .filter(p => p.systemPrompt)
-        .map(p => `### ${p.name}\n${p.systemPrompt}`)
-        .join('\n\n');
-      if (strategyContent) {
-        messages.push({
-          role: 'system',
-          content: `## 分析策略\n\n${strategyContent}`
-        });
-      }
-    }
-  }
-
-  // ── 4. L4 执行层 - 具体技能操作 ──
-  if (selectedSkillIds && selectedSkillIds.length > 0 && skillConfigs) {
-    for (const skillId of selectedSkillIds) {
-      const skillConfig = skillConfigs.get(skillId);
-      if (skillConfig) {
-        let skillContent = `## 技能: ${skillConfig.name || skillId}\n\n${skillConfig.systemPrompt || ''}`;
-        
-        // 注入技能的工具元数据
-        if (skillConfig.tools && skillConfig.tools.length > 0) {
-          skillContent += `\n\n### 可用工具\n`;
-          skillContent += `该技能提供以下工具供您调用：\n\n`;
-          
-          skillConfig.tools.forEach((tool: any) => {
-            skillContent += `#### ${tool.name}\n`;
-            skillContent += `**描述**: ${tool.description || '无描述'}\n`;
-            skillContent += `**参数**: \n`;
-            
-            if (tool.parameters && tool.parameters.properties) {
-              Object.entries(tool.parameters.properties).forEach(([paramName, paramDef]: [string, any]) => {
-                skillContent += `  - ${paramName}: ${paramDef.description || paramDef.type || '未定义'}`;
-                if (tool.parameters.required?.includes(paramName)) {
-                  skillContent += ' (必填)';
-                }
-                skillContent += `\n`;
-              });
-            } else {
-              skillContent += `  - 无参数\n`;
-            }
-            skillContent += `\n`;
-          });
-        }
-        
-        messages.push({
-          role: 'system',
-          content: skillContent
-        });
-      }
-    }
-  }
-
-  // ── 5. L5 上下文层 - 信息召回与整合 ──
-  if (selectedPrompts && selectedPrompts.length > 0) {
-    const contextPrompts = selectedPrompts.filter(p => p.layer === 'L5');
-    if (contextPrompts.length > 0) {
-      const contextContent = contextPrompts
-        .filter(p => p.systemPrompt)
-        .map(p => `### ${p.name}\n${p.systemPrompt}`)
-        .join('\n\n');
-      if (contextContent) {
-        messages.push({
-          role: 'system',
-          content: `## 上下文约束\n\n${contextContent}`
-        });
-      }
-    }
-  }
-
-  // ── 6. 快捷提示（非层级化的自定义提示）──
-  if (selectedPrompts && selectedPrompts.length > 0) {
-    const customPrompts = selectedPrompts.filter(p => p.layer !== 'L3' && p.layer !== 'L5');
-    if (customPrompts.length > 0) {
-      const customContent = customPrompts
-        .filter(p => p.systemPrompt)
-        .map(p => `### ${p.name}\n${p.systemPrompt}`)
-        .join('\n\n');
-      if (customContent) {
-        messages.push({
-          role: 'system',
-          content: `## 自定义提示\n\n${customContent}`
-        });
-      }
-    }
-  }
-
-  // ── 4. 注入项目指令（完整内容，但添加长度限制）──
-  if (instructions.length > 0) {
-    // P1-3: 截断过长的指令内容
-    const MAX_INSTRUCTIONS_CHARS = 3000;
-    let instructionsContent = instructions
-      .map(i => `### ${i.name}\n${i.content}`)
-      .join('\n\n');
-    
-    if (instructionsContent.length > MAX_INSTRUCTIONS_CHARS) {
-      instructionsContent = truncateText(instructionsContent, MAX_INSTRUCTIONS_CHARS, '## 项目特定指令（部分）\n\n');
-    }
-    
-    messages.push({
-      role: 'system',
-      content: `## 项目特定指令\n\n${instructionsContent}`
-    });
-    totalChars += instructionsContent.length;
-  }
-
-  // ── 5. 注入历史消息（最近10条，过滤掉 thinking 状态消息，添加长度限制）──
-  if (recentMessages.length > 0) {
-    // P1-3: 限制历史消息数量和单条消息长度
-    const validHistory = recentMessages
-      .filter(msg => !msg.isThinking && msg.content && msg.content !== 'Yueli AI思考中...')
-      .slice(-MAX_HISTORY_MESSAGES);
-    
-    // P1-3: 限制单条历史消息长度
-    const MAX_HISTORY_MSG_CHARS = 1500;
-
-    validHistory.forEach(msg => {
-      // P1-3: 过滤掉 tool call 执行状态消息（仅保留文本内容）
-      let content = msg.content
-        .replace(/\[工具调用\].*?\n/g, '')
-        .replace(/\[工具结果\].*?\n/g, '')
-        .trim();
-
-      // P1-3: 截断过长的历史消息
-      if (content && content.length > MAX_HISTORY_MSG_CHARS) {
-        content = truncateText(content, MAX_HISTORY_MSG_CHARS);
-      }
-
-      if (!content && !msg.toolCalls && !msg.toolCallId) {
-        return;
-      }
-
-      if (msg.role === 'user') {
-        messages.push({ role: 'user', content });
-      } else if (msg.role === 'assistant') {
-        const assistantMsg: any = { role: 'assistant' };
-        if (content) assistantMsg.content = content;
-        if (msg.toolCalls && msg.toolCalls.length > 0) {
-          assistantMsg.tool_calls = msg.toolCalls;
-        }
-        if (msg.reasoningContent) {
-          assistantMsg.reasoning_content = msg.reasoningContent;
-        }
-        messages.push(assistantMsg);
-      } else if (msg.role === 'tool' && msg.toolCallId) {
-        messages.push({
-          role: 'tool',
-          tool_call_id: msg.toolCallId,
-          content: content || ''
-        });
-      }
-    });
-  }
-
-  // ── 6. 当前用户输入 ──
-  messages.push({ role: 'user', content: userInput });
-
-  return messages;
-};
+const buildMessages = buildChatMessages;
 
 // 样式组件
 const Container = styled.div`
@@ -576,7 +330,8 @@ const Container = styled.div`
 `;
 
 const Sidebar = styled.div`
-  width: 240px;
+  flex-shrink: 0;
+  width: 300px;
   background-color: #ffffff;
   border-right: 1px solid #e8e8e8;
   padding: 20px;
@@ -588,6 +343,7 @@ const MainContent = styled.div`
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
 `;
 
 const ChatHeader = styled.div`
@@ -625,7 +381,9 @@ const ActionButton = styled.button`
 
 const MessagesContainer = styled.div`
   flex: 1;
+  min-width: 0;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 24px;
   display: flex;
   flex-direction: column;
@@ -640,7 +398,9 @@ const InputContainer = styled.div`
   border-top: 1px solid #e8e8e8;
   position: relative;
   z-index: 100;
-  overflow: visible;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: visible;
 `;
 
 const StatusIndicator = styled.div`
@@ -913,17 +673,34 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
     init();
   }, []);
 
+  useEffect(() => {
+    clearLegacyWorkspaceLocalStorage();
+  }, []);
+
+  useEffect(() => {
+    if (!selectedTopic?.id || !Array.isArray(topics)) return;
+    const fresh = topics.find((t: any) => t.id === selectedTopic.id);
+    if (
+      fresh &&
+      (fresh.workspaceLastScanAt !== selectedTopic.workspaceLastScanAt ||
+        fresh.workspaceIndexedCount !== selectedTopic.workspaceIndexedCount ||
+        fresh.workspaceRoot !== selectedTopic.workspaceRoot)
+    ) {
+      setSelectedTopic(fresh);
+    }
+  }, [topics, selectedTopic?.id]);
+
   // P2-5: 调试：打印 localStorage 中的所有数据（仅开发环境）
   useEffect(() => {
     if (!import.meta.env.DEV) return;
     
-    console.log('🔍 调试：localStorage 中的主题数据');
+    devLog('🔍 调试：localStorage 中的主题数据');
     const savedTopics = localStorage.getItem('yueli_topics');
     if (savedTopics) {
       const parsedTopics = JSON.parse(savedTopics);
-      console.log('📚 所有主题:', parsedTopics);
+      devLog('📚 所有主题:', parsedTopics);
       parsedTopics.forEach((topic: any, index: number) => {
-        console.log(`📑 主题 ${index + 1}:`, {
+        devLog(`📑 主题 ${index + 1}:`, {
           id: topic.id,
           name: topic.name,
           hasFiles: topic.files?.length > 0,
@@ -1003,7 +780,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
     // 只在数据加载完成后才处理
     if (!dataLoaded) {
       if (import.meta.env.DEV) {
-        console.log('⏳ 等待数据加载完成...');
+        devLog('⏳ 等待数据加载完成...');
       }
       return;
     }
@@ -1016,22 +793,22 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       const topicsSnap = topicsRef.current;
 
       if (import.meta.env.DEV) {
-        console.log('🔍 处理URL参数 session:', sessionParam);
-        console.log('📊 当前数据:', { sessionsCount: sessionsSnap.length, topicsCount: topicsSnap.length });
+        devLog('🔍 处理URL参数 session:', sessionParam);
+        devLog('📊 当前数据:', { sessionsCount: sessionsSnap.length, topicsCount: topicsSnap.length });
       }
       
       // 首先尝试将其作为会话ID加载
       const session = sessionsSnap.find(s => s.id === sessionParam);
       if (session) {
         if (import.meta.env.DEV) {
-          console.log('✅ 找到会话，自动加载:', session);
+          devLog('✅ 找到会话，自动加载:', session);
         }
         // 直接从 localStorage 读取 sessionMessages，避免引用未定义的 state
         const savedSessionMessages = localStorage.getItem('yueli_session_messages');
         const allSessionMessages = savedSessionMessages ? JSON.parse(savedSessionMessages) : {};
         const sessionData = allSessionMessages[session.id] || [];
         if (import.meta.env.DEV) {
-          console.log('📥 URL 加载会话消息:', {
+          devLog('📥 URL 加载会话消息:', {
             sessionId: session.id,
             messagesCount: sessionData.length,
             preview: sessionData.slice(0, 3).map((m: any) => ({
@@ -1052,8 +829,12 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
           }
           // 同步内存中的 sessionMessages，使其与 localStorage 中实际数据一致，
           // 避免后续 handleSendMessage 写入时基于过期数据覆盖。
-          setSessionMessages(prev => ({ ...prev, [session.id]: sessionData }));
-          setMessages(sessionData);
+          const normalizedSessionData = persistNormalizedSessionMessages(
+            session.id,
+            sessionData as Message[]
+          );
+          setSessionMessages(prev => ({ ...prev, [session.id]: normalizedSessionData }));
+          setMessages(normalizedSessionData);
           setInput('');
           setFiles([]);
           setError(null);
@@ -1065,7 +846,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       const topic = topicsSnap.find(t => t.id === sessionParam);
       if (topic) {
         if (import.meta.env.DEV) {
-          console.log('✅ 找到主题，自动加载:', topic);
+          devLog('✅ 找到主题，自动加载:', topic);
         }
         setTimeout(() => {
           setSelectedTopic(topic);
@@ -1080,13 +861,13 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       }
       
       // 如果都没找到，尝试从 localStorage 重新加载
-      console.warn('内存中未找到对应的会话或主题，尝试从 localStorage 重新加载');
+      devWarn('内存中未找到对应的会话或主题，尝试从 localStorage 重新加载');
       const savedSessions = localStorage.getItem('yueli_sessions');
       if (savedSessions) {
         const allSessions = JSON.parse(savedSessions);
         const savedSession = allSessions.find((s: any) => s.id === sessionParam);
         if (savedSession) {
-          console.log('✅ 从 localStorage 找到会话:', savedSession);
+          devLog('✅ 从 localStorage 找到会话:', savedSession);
           // 更新 sessions 状态
           setSessions(allSessions);
           
@@ -1108,8 +889,12 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                 }
               }
             }
-            setSessionMessages(prev => ({ ...prev, [savedSession.id]: sessionData }));
-            setMessages(sessionData);
+            const normalizedSessionData = persistNormalizedSessionMessages(
+              savedSession.id,
+              sessionData as Message[]
+            );
+            setSessionMessages(prev => ({ ...prev, [savedSession.id]: normalizedSessionData }));
+            setMessages(normalizedSessionData);
             setInput('');
             setFiles([]);
             setError(null);
@@ -1118,7 +903,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         }
       }
       
-      console.warn('未找到对应的会话或主题');
+      devWarn('未找到对应的会话或主题');
       // 显示错误提示
       setTimeout(() => {
         setError(`会话 "${sessionParam}" 不存在或已被删除`);
@@ -1201,7 +986,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
   const [newPromptFunctionPrompt, setNewPromptFunctionPrompt] = useState('');
   const [editingPromptId, setEditingPromptId] = useState<string | null>(null);
   const [isSidebarExpanded, setIsSidebarExpanded] = useState(true);
-  const [isSkillsExpanded, setIsSkillsExpanded] = useState(true);
+  const [isSkillsExpanded, setIsSkillsExpanded] = useState(false);
 
   // 过滤会话（基于已排序的会话列表）
   const filteredSessions = allSessionsSorted.filter(session => 
@@ -1216,9 +1001,13 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
   const [files, setFiles] = useState<ChatFile[]>([]);
   const [isApiConfigModalOpen, setIsApiConfigModalOpen] = useState<boolean>(false);
   const [isKnowledgeModalOpen, setIsKnowledgeModalOpen] = useState<boolean>(false);
+  const [isChatDocumentsModalOpen, setIsChatDocumentsModalOpen] = useState(false);
   const [selectedKnowledge, setSelectedKnowledge] = useState<string[]>([]);
   const [isThinking, setIsThinking] = useState<boolean>(false);
-  const [selectedModel, setSelectedModel] = useState<string>('qwen3.5:latest');
+  const [selectedModel, setSelectedModel] = useState<string>(() => {
+    const saved = localStorage.getItem('selectedModel');
+    return saved?.trim() || 'kgm-dynamic';
+  });
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [sessionMessages, setSessionMessages] = useState<Record<string, any[]>>(() => {
     const saved = localStorage.getItem('yueli_session_messages');
@@ -1258,13 +1047,13 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         const session = sessions.find((s: any) => s.id === sessionId) || null;
         const msgs: any[] = Array.isArray(sm[sessionId]) ? sm[sessionId] : [];
         console.group(`%csession ${sessionId}`, 'font-weight:bold;color:#1890ff');
-        console.log('元数据:', session);
-        console.log('消息数量:', msgs.length);
+        devLog('元数据:', session);
+        devLog('消息数量:', msgs.length);
         msgs.forEach((m, i) => {
           const errInfo = m.error
             ? `${m.error.code || ''} ${m.error.message || ''}`.trim()
             : '';
-          console.log(
+          devLog(
             `%c#${i + 1} ${m.role}${m.status ? ` [${m.status}]` : ''}${errInfo ? ` ⚠ ${errInfo}` : ''}`,
             m.status === 'failed' ? 'color:#f5222d' : 'color:#52c41a',
             { len: (m.content || '').length, preview: (m.content || '').slice(0, 200), provider: m.provider, model: m.model }
@@ -1281,7 +1070,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         const remaining = sessions.filter((s: any) => s.id !== sessionId);
         localStorage.setItem('yueli_session_messages', JSON.stringify(sm));
         localStorage.setItem('yueli_sessions', JSON.stringify(remaining));
-        console.log(`已删除 session ${sessionId}，请刷新页面`);
+        devLog(`已删除 session ${sessionId}，请刷新页面`);
       },
       /** 整体存储用量（localStorage 各 key 的大小，便于诊断 QuotaExceededError） */
       storage() {
@@ -1301,10 +1090,69 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         rows.sort((a, b) => b.bytes - a.bytes);
         console.table(rows.map(r => ({ ...r, kb: (r.bytes / 1024).toFixed(2) })));
         return rows;
+      },
+      /** 按 KGM Markdown 规则清洗全部历史会话并写回 localStorage；force:true 忽略已迁移标记 */
+      migrateSessionMessages(options?: { force?: boolean }) {
+        const r = migrateSessionMessagesInLocalStorage(options);
+        devLog('[debugYueli] migrateSessionMessages', r);
+        return r;
+      },
+      /** 将指定 session 导出到 Skill Executor，供 scripts/analyze_session_dump.mjs 分析 */
+      async exportSessionDump(sessionId: string) {
+        const sm = readJSON('yueli_session_messages') || {};
+        const msgs = sm[sessionId];
+        if (!Array.isArray(msgs)) {
+          devWarn('无此 session 消息:', sessionId);
+          return { ok: false, error: 'session not found' };
+        }
+        const base = resolveSkillExecutorBaseUrl();
+        if (!base) return { ok: false, error: 'Skill Executor URL 未配置' };
+        const url = `${base.replace(/\/$/, '')}/v1/dev/session-dump`;
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sessionId, messages: msgs, exportedAt: new Date().toISOString() })
+        });
+        const data = await res.json().catch(() => ({}));
+        devLog('[debugYueli] exportSessionDump', data);
+        return data;
+      },
+      /** 打印某条 bot 消息原文与 prepare 后对比 */
+      inspectBotMarkdown(sessionId: string, index = -1) {
+        const sm = readJSON('yueli_session_messages') || {};
+        const msgs: any[] = Array.isArray(sm[sessionId]) ? sm[sessionId] : [];
+        const bots = msgs.filter((m) => m.role === 'bot' || m.role === 'assistant');
+        const m = bots.at(index) ?? bots[bots.length - 1];
+        if (!m) return { error: 'no bot message' };
+        const raw = String(m.content || '');
+        return {
+          id: m.id,
+          rawLen: raw.length,
+          rawNewlines: (raw.match(/\n/g) || []).length,
+          hasDoubleDashHash: /--##/.test(raw),
+          preview: raw.slice(0, 600)
+        };
+      },
+      /** 清除 KGM 金丝雀预检缓存；返回可读说明（removeItem 本身返回 undefined 是正常的） */
+      clearPreflightCache() {
+        const r = apiService.clearKgmCanaryCache();
+        devLog('[debugYueli] clearPreflightCache', r.message);
+        return r;
+      },
+      /** 查看/切换 PDF 附件聊天模式：compact（默认）| full_committee */
+      pdfAttachmentChatMode(mode?: 'compact' | 'full_committee') {
+        if (mode === 'compact' || mode === 'full_committee') {
+          localStorage.setItem('yueli_pdf_attachment_chat_mode', mode);
+          return { ok: true, mode, message: `已设为 ${mode}` };
+        }
+        const current = localStorage.getItem('yueli_pdf_attachment_chat_mode') || 'compact';
+        return { current, hint: 'debugYueli.pdfAttachmentChatMode("compact") 或 ("full_committee")' };
       }
     };
     if (import.meta.env.DEV) {
-      console.log('🛠 debugYueli ready - 可用方法: sessions() / session(id) / storage() / deleteSession(id)');
+      devLog(
+        '🛠 debugYueli ready - sessions() / session(id) / clearPreflightCache() / pdfAttachmentChatMode()'
+      );
     }
   }, []);
 
@@ -1321,21 +1169,101 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         try {
           localStorage.setItem('yueli_session_messages', JSON.stringify(next));
         } catch (e) {
-          console.error('Failed to persist session messages:', e);
+          devError('Failed to persist session messages:', e);
         }
         return next;
       });
     },
     []
   );
-  const [selectedProvider, setSelectedProvider] = useState<'kgm' | 'ollama'>(() => {
+  const [selectedProvider, setSelectedProvider] = useState<ChatProvider>(() => {
     const saved = localStorage.getItem('selectedProvider');
-    return (saved as 'kgm' | 'ollama') || 'kgm';
+    if (saved === 'anthropic') return 'kgm';
+    return (saved as ChatProvider) || 'kgm';
   });
 
-  const modelOptions = useMemo(() => {
-    const cloudConfig = safeParseCloudConfig(localStorage.getItem('cloudProviders'));
-    return resolveModelOptionsFromCloudConfig(cloudConfig).options;
+  useEffect(() => {
+    if (localStorage.getItem('selectedProvider') === 'anthropic') {
+      localStorage.setItem('selectedProvider', 'kgm');
+      setSelectedProvider('kgm');
+    }
+  }, []);
+
+  /** 云端推理等写入 localStorage 后刷新 modelOptions；同标签页依赖配置弹窗 onClose 递增 */
+  const [cloudProvidersRevision, setCloudProvidersRevision] = useState(0);
+  const [kgmCatalog, setKgmCatalog] = useState<KgmCatalogEntry[]>([]);
+
+  const modelOptions = useMemo((): TieredModelOption[] => {
+    if (selectedProvider === 'kgm' || selectedProvider === 'yueliai') {
+      return buildTieredModelOptions(kgmCatalog);
+    }
+    const cloudConfig = loadChatCloudConfigFromLocalStorage();
+    return resolveModelOptionsFromCloudConfig(cloudConfig).options.map((o) => ({
+      ...o,
+      tier: 'L1' as const,
+      group: '第1层 · KGM（Playground / auto）'
+    }));
+  }, [cloudProvidersRevision, kgmCatalog, selectedProvider]);
+
+  useEffect(() => {
+    if (selectedProvider !== 'kgm' && selectedProvider !== 'yueliai') return;
+    const kgmRoot = apiService.resolveChatRuntimeSnapshot('kgm-dynamic', 'kgm').kgmHttpRootDisplay;
+    void fetchKgmModelCatalog(kgmRoot).then((entries) => {
+      setKgmCatalog(entries);
+    });
+  }, [selectedProvider, selectedModel, cloudProvidersRevision]);
+
+  /** 与 send / 预检一致：KGM 下展示规范化后的 model（动态路由为 auto），真实上游由 KGM L2>L1 路由 */
+  const chatRuntimeSnap = useMemo(
+    () => apiService.resolveChatRuntimeSnapshot(selectedModel, selectedProvider),
+    [selectedModel, selectedProvider, cloudProvidersRevision]
+  );
+  const routePlan = useChatRoutePlan(selectedProvider, selectedModel);
+  const chatRuntimeBadge = `${routePlan.tier} · ${routePlan.vendor || routePlan.provider}:${routePlan.displayModel}`;
+  const resolvedChatRequestModel = chatRuntimeSnap.model;
+
+  const skillNamesMap = useMemo(() => {
+    const m = new Map<string, string>();
+    const configs = orchestrator?.getSkillExecutor?.()?.getSkillConfigs?.();
+    for (const id of activeSkillIds) {
+      const cfg = configs?.get(id);
+      m.set(id, cfg?.name || skills.find((s) => s.id === id)?.name || id);
+    }
+    return m;
+  }, [orchestrator, activeSkillIds, skills]);
+
+  const composerOpenAiToolsSent = useMemo(
+    () => messages.some((m) => m.role === 'tool'),
+    [messages]
+  );
+
+  useEffect(() => {
+    if (!modelOptions?.length) return;
+    const valid = new Set(modelOptions.map((o) => o.value));
+    const cur = `${selectedProvider}:${selectedModel}`;
+    if (valid.has(cur)) return;
+    const sameProv = modelOptions.find((o) => String(o.value).startsWith(`${selectedProvider}:`));
+    const pick = sameProv ?? modelOptions[0];
+    if (!pick?.value) return;
+    const [p, ...rest] = String(pick.value).split(':');
+    const m = rest.join(':');
+    setSelectedProvider(p as ChatProvider);
+    setSelectedModel(m);
+    localStorage.setItem('selectedProvider', p);
+    localStorage.setItem('selectedModel', m);
+  }, [modelOptions, selectedProvider, selectedModel]);
+
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'cloudProviders' || e.key === 'kgmScheduleStrategy') setCloudProvidersRevision((x) => x + 1);
+    };
+    const onLocalCloudSave = () => setCloudProvidersRevision((x) => x + 1);
+    window.addEventListener('storage', onStorage);
+    window.addEventListener('yueli-cloud-providers-changed', onLocalCloudSave);
+    return () => {
+      window.removeEventListener('storage', onStorage);
+      window.removeEventListener('yueli-cloud-providers-changed', onLocalCloudSave);
+    };
   }, []);
 
   const enabledToolsCount = useMemo(() => {
@@ -1486,6 +1414,118 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
     timestamp: number;
   }>>([]);
 
+  /** 模态框 / 底栏 Popover 互斥：同时只显示一个 */
+  const closeAllExclusiveOverlays = useCallback(() => {
+    setIsAddMenuOpen(false);
+    setIsApiConfigModalOpen(false);
+    setIsKnowledgeModalOpen(false);
+    setIsChatDocumentsModalOpen(false);
+    setIsPromptConfigModalOpen(false);
+    setIsCreateTopicModalOpen(false);
+    setIsRenameModalOpen(false);
+    setIsDeleteConfirmOpen(false);
+    setIsInstructionModalOpen(false);
+    setIsAddInstructionModalOpen(false);
+    setIsSearchModalOpen(false);
+    setIsHistorySearchModalOpen(false);
+    setIsSkillInstallModalOpen(false);
+  }, []);
+
+  type ExclusiveOverlayKey =
+    | 'addMenu'
+    | 'apiConfig'
+    | 'knowledge'
+    | 'chatDocuments'
+    | 'promptConfig'
+    | 'createTopic'
+    | 'rename'
+    | 'deleteConfirm'
+    | 'instruction'
+    | 'addInstruction'
+    | 'search'
+    | 'historySearch'
+    | 'skillInstall';
+
+  const openExclusiveOverlay = useCallback(
+    (key: ExclusiveOverlayKey) => {
+      closeAllExclusiveOverlays();
+      switch (key) {
+        case 'addMenu':
+          setIsAddMenuOpen(true);
+          break;
+        case 'apiConfig':
+          setIsApiConfigModalOpen(true);
+          break;
+        case 'knowledge':
+          setIsKnowledgeModalOpen(true);
+          break;
+        case 'chatDocuments':
+          setIsChatDocumentsModalOpen(true);
+          break;
+        case 'promptConfig':
+          setIsPromptConfigModalOpen(true);
+          break;
+        case 'createTopic':
+          setIsCreateTopicModalOpen(true);
+          break;
+        case 'rename':
+          setIsRenameModalOpen(true);
+          break;
+        case 'deleteConfirm':
+          setIsDeleteConfirmOpen(true);
+          break;
+        case 'instruction':
+          setIsInstructionModalOpen(true);
+          break;
+        case 'addInstruction':
+          setIsAddInstructionModalOpen(true);
+          break;
+        case 'search':
+          setIsSearchModalOpen(true);
+          break;
+        case 'historySearch':
+          setIsHistorySearchModalOpen(true);
+          break;
+        case 'skillInstall':
+          setIsSkillInstallModalOpen(true);
+          break;
+        default: {
+          const _exhaustive: never = key;
+          void _exhaustive;
+        }
+      }
+    },
+    [closeAllExclusiveOverlays]
+  );
+
+  const toggleExclusiveOverlay = useCallback(
+    (key: ExclusiveOverlayKey, isOpen: boolean) => {
+      if (isOpen) {
+        closeAllExclusiveOverlays();
+      } else {
+        openExclusiveOverlay(key);
+      }
+    },
+    [closeAllExclusiveOverlays, openExclusiveOverlay]
+  );
+
+  useEffect(() => {
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      closeAllExclusiveOverlays();
+    };
+    window.addEventListener('keydown', handleEscape);
+    return () => window.removeEventListener('keydown', handleEscape);
+  }, [closeAllExclusiveOverlays]);
+
+  const openToolsMenuTab = useCallback(
+    (tab: typeof toolsMenuDefaultTab) => {
+      setToolsMenuDefaultTab(tab);
+      openExclusiveOverlay('addMenu');
+    },
+    [openExclusiveOverlay]
+  );
+
   // 主题相关状态
   const [theme, setTheme] = useState<'light' | 'dark'>(() => {
     const saved = localStorage.getItem('theme');
@@ -1494,9 +1534,80 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  /** 系统文件框打开时忽略 Popover 的 onOpenChange(false)，避免失焦收起菜单 */
+  const isPickingFilesRef = useRef(false);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const input = fileInputRef.current;
+    if (!input) return;
+    const onCancel = () => {
+      isPickingFilesRef.current = false;
+    };
+    input.addEventListener('cancel', onCancel);
+    return () => input.removeEventListener('cancel', onCancel);
+  }, []);
+
+  const beginFilePick = useCallback(() => {
+    isPickingFilesRef.current = true;
+    openExclusiveOverlay('addMenu');
+  }, [openExclusiveOverlay]);
+
+  const handleToolsMenuUploadFiles = useCallback(async () => {
+    beginFilePick();
+    try {
+      const desktopPicked = await pickChatFilesViaDesktop();
+      if (desktopPicked === null) {
+        window.setTimeout(() => fileInputRef.current?.click(), 0);
+        return;
+      }
+      if (desktopPicked.length > 0) {
+        setFiles((prev) => [...prev, ...desktopPicked]);
+        setIsAddMenuOpen(false);
+      }
+      isPickingFilesRef.current = false;
+    } catch (err) {
+      devError('[upload] 选择文件失败:', err);
+      isPickingFilesRef.current = false;
+    }
+  }, [beginFilePick]);
+  const [voiceInterimDisplay, setVoiceInterimDisplay] = useState('');
   const accumulatedContentRef = useRef<string>('');
   const lastIncrementalSaveAtRef = useRef<number>(0);
+
+  const handleVoiceInterim = useCallback((s: string) => {
+    setVoiceInterimDisplay(s);
+  }, []);
+
+  const appendVoiceTranscript = useCallback((segment: string) => {
+    const t = segment.replace(/\s+/g, ' ').trim();
+    if (!t) return;
+    setInput((prev) => {
+      const el = textAreaRef.current;
+      if (!el) {
+        if (!prev) return t;
+        const join = /\s$/.test(prev) || /^[，。！？、；：,.!?]/.test(t) ? '' : ' ';
+        return prev + join + t;
+      }
+      const start = typeof el.selectionStart === 'number' ? el.selectionStart : prev.length;
+      const end = typeof el.selectionEnd === 'number' ? el.selectionEnd : prev.length;
+      const prefix = prev.slice(0, start);
+      const suffix = prev.slice(end);
+      const needSpace = prefix.length > 0 && !/\s$/.test(prefix) && !/^[，。！？、；：,.!?]/.test(t);
+      const ins = (needSpace ? ' ' : '') + t;
+      const next = prefix + ins + suffix;
+      requestAnimationFrame(() => {
+        try {
+          el.focus();
+          const pos = prefix.length + ins.length;
+          el.setSelectionRange(pos, pos);
+        } catch {
+          /* ignore */
+        }
+      });
+      return next;
+    });
+  }, []);
 
   // 格式化最后活跃时间
   const formatLastActiveTime = (timestamp: number) => {
@@ -1656,7 +1767,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         } else if (renderedOutput.type === 'json') {
           displayContent = `\`\`\`json\n${renderedOutput.content}\n\`\`\``;
         } else {
-          displayContent = renderedOutput.content;
+          displayContent = finalizeKgmAssistantMarkdownIfNeeded(renderedOutput.content);
         }
 
         const editedMeta = {
@@ -1680,7 +1791,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
           time: new Date().toLocaleTimeString(),
           isThinking: false,
           provider: selectedProvider,
-          model: selectedModel,
+          model: resolvedChatRequestModel,
           finalStatus: 'done' as const
         };
 
@@ -1695,7 +1806,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                 content: displayContent,
                 isThinking: false,
                 provider: selectedProvider,
-                model: selectedModel,
+                model: resolvedChatRequestModel,
                 finalStatus: 'done' as const
               };
             }
@@ -1716,7 +1827,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         return;
       }
     } catch (orchestratorError) {
-      console.warn('编排器处理失败，继续使用原始输入');
+      devWarn('编排器处理失败，继续使用原始输入');
     }
 
     // 获取项目主题关联的指令
@@ -1741,15 +1852,23 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         toolCallHandler = orchResult.toolCallHandler;
       }
     } catch (e) {
-      console.warn('获取工具定义失败');
+      devWarn('获取工具定义失败');
     }
     
     // 构建完整的 messages 并走 LLM；与发送消息一致写入 localStorage（yueli_session_messages）
     try {
       const selectedPromptObjects = prompts.filter(p => selectedPrompts.includes(p.id));
+      const { freshTopic, topicFusionContext } = await fetchTopicFusionContext(
+        selectedTopic,
+        topics,
+        processedContent,
+        sessionId,
+        newMessages,
+        activeSkillIds
+      );
       const apiMessages = buildMessages(
         processedContent,
-        selectedTopic,
+        freshTopic,
         newMessages,
         topicInstructions,
         knowledgeItems,
@@ -1758,7 +1877,8 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         selectedPromptObjects,
         personalityPrompt,
         processedContent,
-        knowledgeRagContext
+        knowledgeRagContext,
+        { topicFusionContext }
       );
 
       setMessages((prev) =>
@@ -1784,7 +1904,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         typeof window !== 'undefined' &&
         window.localStorage?.getItem('yueli_debug_stream') === '1';
       if (debugStream) {
-        console.debug('🚀 当前激活的技能:', currentActiveSkills);
+        devDebug('🚀 当前激活的技能:', currentActiveSkills);
       }
 
       const editSendRes = await sendOllamaMessageWithMessages(
@@ -1792,7 +1912,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         apiMessages,
         (data) => {
           if (debugStream) {
-            console.debug('📡 收到消息回调数据:', {
+            devDebug('📡 收到消息回调数据:', {
               hasMessage: Boolean(data?.message),
               messageKeys: data?.message ? Object.keys(data.message) : [],
               hasToolExecuting: Boolean(data?.tool_call_executing),
@@ -1826,7 +1946,40 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         },
         { tools, toolCallHandler: makePermissionAwareToolCallHandler(toolCallHandler), enabledSkillIds: activeSkillIds }
       );
-      const editInvocationMetrics = extractInvocationMetrics(editSendRes);
+      const editInvocationMetrics = extractInvocationMetrics(editSendRes, routePlan);
+
+      if (updateTimer) {
+        clearTimeout(updateTimer);
+        updateTimer = null;
+      }
+      const editApi = editSendRes && typeof editSendRes === 'object' ? editSendRes : {};
+      let editResolvedContent =
+        streamStateRef.current.accumulatedContent ||
+        (typeof editApi.content === 'string' ? editApi.content : '') ||
+        '';
+      const editResolvedReasoning =
+        streamStateRef.current.reasoningContent ||
+        (typeof editApi.reasoningContent === 'string' ? editApi.reasoningContent : '') ||
+        undefined;
+      const editThinkingFromApi =
+        typeof editApi.thinkingContent === 'string' && editApi.thinkingContent.trim()
+          ? editApi.thinkingContent
+          : '';
+      const editResolvedThinkingRecords =
+        streamStateRef.current.thinkingRecords.length > 0
+          ? streamStateRef.current.thinkingRecords
+          : editThinkingFromApi
+            ? [{ content: editThinkingFromApi, timestamp: Date.now() }]
+            : undefined;
+
+      editResolvedContent = pickAssistantVisibleRawText({
+        accumulatedContent: editResolvedContent,
+        toolCallRecords: streamStateRef.current.toolCallRecords,
+        reasoningContent: editResolvedReasoning,
+        thinkingContent: editThinkingFromApi,
+        thinkingRecords: streamStateRef.current.thinkingRecords
+      });
+      editResolvedContent = finalizeKgmAssistantMarkdownIfNeeded(editResolvedContent);
 
       setMessages((prev) =>
         prev.map((msg) => {
@@ -1845,11 +1998,11 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
           if (msg.id === botMessageIdRef.current) {
             return {
               ...msg,
-              content: streamStateRef.current.accumulatedContent || '',
+              content: editResolvedContent,
               isThinking: false,
-              reasoningContent: streamStateRef.current.reasoningContent || undefined,
+              reasoningContent: editResolvedReasoning,
               toolCallRecords: streamStateRef.current.toolCallRecords,
-              thinkingRecords: streamStateRef.current.thinkingRecords,
+              thinkingRecords: editResolvedThinkingRecords,
               sources: streamStateRef.current.sources.length ? streamStateRef.current.sources : undefined,
               skillsUsed: currentActiveSkills,
               permissionAuditTrail:
@@ -1882,15 +2035,15 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         const botRowSerial = {
           id: botMessageIdRef.current,
           role: 'bot',
-          content: streamStateRef.current.accumulatedContent || '',
+          content: editResolvedContent,
           sender: 'Yueli Copilot',
           time: new Date().toLocaleTimeString(),
           isThinking: false,
           provider: selectedProvider,
-          model: selectedModel,
-          reasoningContent: streamStateRef.current.reasoningContent || undefined,
+          model: resolvedChatRequestModel,
+          reasoningContent: editResolvedReasoning,
           toolCallRecords: streamStateRef.current.toolCallRecords,
-          thinkingRecords: streamStateRef.current.thinkingRecords,
+          thinkingRecords: editResolvedThinkingRecords,
           sources: streamStateRef.current.sources.length ? streamStateRef.current.sources : undefined,
           permissionAuditTrail:
             permissionAuditForBotRef.current.length > 0 ? [...permissionAuditForBotRef.current] : undefined,
@@ -1947,7 +2100,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
           time: new Date().toLocaleTimeString(),
           isThinking: false,
           provider: selectedProvider,
-          model: selectedModel,
+          model: resolvedChatRequestModel,
           status: 'failed' as const,
           finalStatus: 'error' as const
         };
@@ -1963,14 +2116,22 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
   const handleSendMessage = async (content: string, files: ChatFile[] = []) => {
     if (!content.trim() && files.length === 0) return;
 
+    const filesToSend = [...files];
+    const userNote = content.trim();
+    const attachmentNames = filesToSend.map((f) => f.name);
+
     const userMessage: Message = {
       id: `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
       role: 'user',
-      content: content.trim(),
+      content: formatUserMessageWithAttachments(userNote, attachmentNames),
       sender: 'User',
       time: new Date().toLocaleTimeString(),
       isThinking: false,
-      status: 'sending'
+      status: 'sending',
+      metadata:
+        attachmentNames.length > 0
+          ? { attached_files: attachmentNames, user_visible_input: userNote }
+          : undefined
     };
 
     // 确保有会话ID
@@ -1981,8 +2142,239 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
     setMessages(prev => [...prev, userMessage]);
     setInput('');
     setFiles([]);
-    setIsLoading(true);
     setError(null);
+
+    /** 附件正文注入 LLM（此前仅 UI 展示，未进入 buildMessages） */
+    let attachmentLlmPayload = '';
+    if (filesToSend.length > 0) {
+      try {
+        const blocks = await extractTextFromChatFiles(filesToSend, {
+          sessionId,
+          topicId: selectedTopic?.id
+        });
+        const failed = blocks.filter((b) => b.error);
+        const extractedChars = blocks.reduce((n, b) => n + (b.text?.length ?? 0), 0);
+        if (failed.length === blocks.length) {
+          toast.error(
+            `附件解析失败：${failed.map((b) => `${b.name}（${b.error}）`).join('、')}`
+          );
+          setMessages((prev) =>
+            prev.map((m) => (m.id === userMessage.id ? { ...m, status: 'failed' as const } : m))
+          );
+          setIsLoading(false);
+          return;
+        }
+        if (extractedChars < 80) {
+          toast.error(
+            `PDF 未解析出可用正文（约 ${extractedChars} 字），可能为扫描版或 pdf.js 加载失败。请粘贴文本或换可复制文字的 PDF。`
+          );
+          setMessages((prev) =>
+            prev.map((m) => (m.id === userMessage.id ? { ...m, status: 'failed' as const } : m))
+          );
+          setIsLoading(false);
+          return;
+        }
+        if (failed.length > 0) {
+          toast(`部分附件解析失败：${failed.map((b) => b.name).join('、')}`);
+        }
+
+        const validBlocks = blocks
+          .filter((b) => !b.error && b.text?.trim())
+          .map((b) => ({ name: b.name, text: b.text!.trim(), error: b.error }));
+        const attachmentChatMode = readPdfAttachmentChatMode();
+        const pipeline = await ingestPdfAttachmentsForChat({
+          sessionId,
+          blocks: validBlocks,
+          userNote,
+          apiService,
+          model: resolvedChatRequestModel,
+          skipRoleStage: true
+        });
+        const docIds = pipeline.documents.map((d) => d.id);
+
+        if (attachmentChatMode === 'compact') {
+          const built = await buildAttachmentChatPromptForLlm({
+            mode: 'compact',
+            sessionId,
+            documentIds: docIds,
+            userNote,
+            apiService
+          });
+          attachmentLlmPayload = built.prompt;
+          userMessage.metadata = {
+            ...(userMessage.metadata || {}),
+            attached_files: attachmentNames,
+            attachment_extract_chars: extractedChars,
+            document_ids: docIds,
+            pdf_pipeline_indexed_chunks: pipeline.indexedChunkCount,
+            pdf_chat_prompt_mode: 'compact',
+            pdf_orchestrator_pre_pipeline: false
+          };
+          toast.success(
+            `PDF 已入库（${pipeline.indexedChunkCount} 块）；紧凑模式：RRF 召回 + 非流式推理（约 10 分钟上限，请耐心等待）。`,
+            { duration: 6000 }
+          );
+        } else {
+          let orchRoles: ReturnType<typeof orchestratorPdfSkillResultsToRoleOutputs> = [];
+          let usedOrchestratorPrePipeline = false;
+          try {
+            const orchPdf = await processWithOrchestrator(
+              userNote,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              {
+                pdfAttachmentContext: {
+                  blocks: validBlocks,
+                  userNote,
+                  primaryFileName: validBlocks[0]?.name
+                }
+              }
+            );
+            orchRoles = orchestratorPdfSkillResultsToRoleOutputs(orchPdf.skillResults);
+            usedOrchestratorPrePipeline = orchRoles.length > 0;
+          } catch (orchPdfErr) {
+            devWarn('[handleSendMessage] PDF 编排器预管道失败，回退 Executor 角色', orchPdfErr);
+          }
+
+          let committeeRoles: ReturnType<typeof orchestratorPdfSkillResultsToRoleOutputs> = [];
+          if (!usedOrchestratorPrePipeline) {
+            const fallbackRoles: ReturnType<typeof orchestratorPdfSkillResultsToRoleOutputs> = [];
+            const pipeMode = readPdfPipelineMode();
+            for (const block of validBlocks) {
+              const fileRoles = await runPdfOrchestratorRoleStage({
+                rawText: block.text!,
+                fileName: block.name,
+                userNote,
+                apiService,
+                model: resolvedChatRequestModel,
+                pipelineMode: pipeMode
+              });
+              fallbackRoles.push(...fileRoles);
+            }
+            const ragIdxFb = pipeline.roleOutputs.findIndex((r) => r.roleId === 'rag_curator');
+            const beforeRagFb =
+              ragIdxFb >= 0 ? pipeline.roleOutputs.slice(0, ragIdxFb) : pipeline.roleOutputs;
+            const ragPartFb = ragIdxFb >= 0 ? pipeline.roleOutputs.slice(ragIdxFb) : [];
+            committeeRoles = [...beforeRagFb, ...fallbackRoles, ...ragPartFb];
+            toast.success(
+              `PDF 已入库（${pipeline.indexedChunkCount} 块）；完整委员会模式，编排器不可用已回退 Executor。`,
+              { duration: 6000 }
+            );
+          } else {
+            const ragIdx = pipeline.roleOutputs.findIndex((r) => r.roleId === 'rag_curator');
+            const beforeRag =
+              ragIdx >= 0 ? pipeline.roleOutputs.slice(0, ragIdx) : pipeline.roleOutputs;
+            const ragPart = ragIdx >= 0 ? pipeline.roleOutputs.slice(ragIdx) : [];
+            committeeRoles = [...beforeRag, ...orchRoles, ...ragPart];
+            toast.success(
+              `PDF 已入库（${pipeline.indexedChunkCount} 块）；完整委员会模式（四角色全文注入，耗时较长）。`,
+              { duration: 6000 }
+            );
+          }
+
+          const built = await buildAttachmentChatPromptForLlm({
+            mode: 'full_committee',
+            sessionId,
+            documentIds: docIds,
+            userNote,
+            apiService,
+            committeeRoleOutputs: committeeRoles
+          });
+          attachmentLlmPayload = built.prompt;
+          userMessage.metadata = {
+            ...(userMessage.metadata || {}),
+            attached_files: attachmentNames,
+            attachment_extract_chars: extractedChars,
+            document_ids: docIds,
+            pdf_pipeline_indexed_chunks: pipeline.indexedChunkCount,
+            pdf_pipeline_roles: committeeRoles.map((r) => r.roleId),
+            pdf_pipeline_mode: pipeline.pipelineMode,
+            pdf_chat_prompt_mode: 'full_committee',
+            pdf_orchestrator_pre_pipeline: usedOrchestratorPrePipeline
+          };
+        }
+      } catch (attachErr) {
+        devError('[handleSendMessage] 附件解析失败:', attachErr);
+        toast.error('附件解析失败，请重试或换用 TXT/MD/PDF');
+        setMessages((prev) =>
+          prev.map((m) => (m.id === userMessage.id ? { ...m, status: 'failed' as const } : m))
+        );
+        return;
+      }
+    }
+
+    /** 无新附件、会话内已有 document_ids → 追问模式（仅 RAG，不重跑委员会） */
+    if (!attachmentLlmPayload && filesToSend.length === 0 && userNote) {
+      const priorDocIds = collectSessionDocumentIds(messages);
+      if (priorDocIds.length > 0) {
+        try {
+          const follow = await buildDocumentFollowUpPrompt({
+            sessionId,
+            documentIds: priorDocIds,
+            userNote,
+            apiService,
+            topicId: selectedTopic?.id,
+            topic: resolveTopicFromList(selectedTopic, topics),
+            includeWebFusion: activeSkillIds?.includes('desktop-knowledge-agent')
+          });
+          attachmentLlmPayload = follow.prompt;
+          userMessage.metadata = {
+            ...(userMessage.metadata || {}),
+            document_ids: priorDocIds,
+            pdf_follow_up: true
+          };
+          toast.success('PDF 追问：仅向量/服务端召回，未重跑委员会。', { duration: 4000 });
+        } catch (followErr) {
+          devWarn('[handleSendMessage] PDF 追问构建失败', followErr);
+        }
+      }
+    }
+
+    /** 管理口令门控：不调用 LLM，直接在对话区输出配置/管理入口说明 */
+    const adminParse =
+      filesToSend.length === 0 ? parseAdminManagementInput(userNote) : ({ kind: 'none' as const });
+    const adminAssistantText = composeAdminManagementAssistantText(adminParse, selectedModel, selectedProvider);
+    if (adminAssistantText !== null) {
+      const adminBotId = `msg-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const adminTime = new Date().toLocaleTimeString();
+      const adminBotMessage: Message = {
+        id: adminBotId,
+        role: 'bot',
+        content: adminAssistantText,
+        sender: 'Yueli Copilot',
+        time: adminTime,
+        isThinking: false,
+        provider: selectedProvider,
+        model: resolvedChatRequestModel,
+        finalStatus: 'done'
+      };
+      setMessages((prev) => [
+        ...prev.map((m) => (m.id === userMessage.id ? { ...m, status: 'sent' as const } : m)),
+        adminBotMessage
+      ]);
+      persistSessionMessages(sessionId, (prevList) => {
+        const without = prevList.filter((m: any) => m?.id !== userMessage.id && m?.id !== adminBotId);
+        return [
+          ...without,
+          { ...userMessage, status: 'sent' as const },
+          {
+            id: adminBotId,
+            role: 'bot',
+            content: adminAssistantText,
+            sender: 'Yueli Copilot',
+            time: adminTime,
+            isThinking: false,
+            provider: selectedProvider,
+            model: selectedModel
+          }
+        ];
+      });
+      return;
+    }
+
+    setIsLoading(true);
 
     /** 与 catch/finally 共享：落盘用户行（content 始终为用户可见输入） */
     let userRowForPersistence: Message = userMessage;
@@ -2009,7 +2401,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         time: new Date().toLocaleTimeString(),
         isThinking: true,
         provider: selectedProvider,
-        model: selectedModel,
+        model: resolvedChatRequestModel,
         skillsUsed: currentActiveSkills,
         finalStatus: 'in_progress' as const,
         executionTimeline: []
@@ -2020,25 +2412,31 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       let updateTimer: ReturnType<typeof setTimeout> | null = null;
       // thinkingContentRef / reasoningContentRef / sourcesRef 已在 try 外声明，便于 catch 复用
       
-      // 首先使用编排器处理输入
-      let processedContent = content;
+      // 首先使用编排器处理输入（路由/技能用用户可见短句；附件正文在下方单独注入 LLM）
+      let processedContent = userNote;
       let hasRenderedOutput = false;
       let renderedOutput: RenderedOutput | undefined;
 
       try {
+        if (attachmentLlmPayload) {
+          devLog('[YueliCopilot] 附件任务：已构建 LLM prompt，跳过首轮编排器');
+        } else {
         const stageTimes = new Map<string, number>();
-        const orchestratorResult = await processWithOrchestrator(content, undefined, undefined, undefined, (evt) => {
+        const orchestratorResult = await processWithOrchestrator(userNote, undefined, undefined, undefined, (evt) => {
           const raw = evt.stage || '';
-          const [stageRaw, phaseRaw] = raw.split(':');
-          const stage = (stageRaw || raw) as any;
-          const phase = phaseRaw || '';
+          const colonIdx = raw.indexOf(':');
+          const stage = (colonIdx >= 0 ? raw.slice(0, colonIdx) : raw) as any;
+          const phase = colonIdx >= 0 ? raw.slice(colonIdx + 1) : '';
           const at = typeof evt.at === 'number' ? evt.at : Date.now();
           const key = `${evt.runId}:${stage}`;
 
           let durationMs: number | undefined;
           if (phase === 'start') {
             stageTimes.set(key, at);
-          } else if (phase === 'end') {
+            // 不在时间线里追加「分析/准备」的 start 行，避免与 end 行重复；仅 end / 无阶段事件落一条
+            return;
+          }
+          if (phase === 'end') {
             const startedAt = stageTimes.get(key);
             if (typeof startedAt === 'number') durationMs = at - startedAt;
           }
@@ -2089,7 +2487,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
           } else if (renderedOutput.type === 'json') {
             displayContent = `\`\`\`json\n${renderedOutput.content}\n\`\`\``;
           } else {
-            displayContent = renderedOutput.content;
+            displayContent = finalizeKgmAssistantMarkdownIfNeeded(renderedOutput.content);
           }
 
           const userRowRendered: Message = {
@@ -2135,8 +2533,9 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
           setIsThinking(false);
           return;
         }
+        }
       } catch (orchestratorError) {
-        console.warn('编排器处理失败，继续使用原始输入');
+        devWarn('编排器处理失败，继续使用原始输入');
       }
 
       // 获取项目主题关联的指令
@@ -2153,22 +2552,60 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       let tools: any[] | undefined;
       let toolCallHandler: ((name: string, args: any) => Promise<string>) | undefined;
       let knowledgeRagContext: string | undefined;
-      try {
-        const orchResult = await processWithOrchestrator(processedContent, activeSkillIds);
-        knowledgeRagContext = orchResult.ragContext;
-        if (orchResult.tools && orchResult.tools.length > 0) {
-          tools = orchResult.tools;
-          toolCallHandler = orchResult.toolCallHandler;
+      if (!attachmentLlmPayload) {
+        try {
+          const orchResult = await processWithOrchestrator(processedContent, activeSkillIds);
+          knowledgeRagContext = orchResult.ragContext;
+          if (orchResult.tools && orchResult.tools.length > 0) {
+            tools = orchResult.tools;
+            toolCallHandler = orchResult.toolCallHandler;
+          }
+        } catch (e) {
+          devWarn('获取工具定义失败');
         }
-      } catch (e) {
-        console.warn('获取工具定义失败');
+      } else {
+        // 附件首轮跳过重编排/知识库向量召回以控延迟，但仍装载 active skill tools，保证 FC 可用
+        devLog('[YueliCopilot] 附件任务：跳过 processWithOrchestrator 编排召回，保留 skill tools');
+        try {
+          if (skillExecutor && activeSkillIds.length > 0) {
+            tools = skillExecutor.getAllToolDefinitions(activeSkillIds) as any[];
+            if (tools && tools.length > 0) {
+              toolCallHandler = async (name: string, args: any) =>
+                skillExecutor.executeToolCall(name, args);
+            }
+          }
+        } catch (e) {
+          devWarn('附件任务装载工具定义失败');
+        }
       }
 
       // 构建完整的messages数组（修复：注入知识库、完整指令、完整历史、快捷提示systemPrompt）
       const selectedPromptObjects = prompts.filter(p => selectedPrompts.includes(p.id));
-      const apiMessages = buildMessages(
-        processedContent,
+      let apiUserInput = processedContent;
+      if (attachmentLlmPayload) {
+        if (
+          processedContent &&
+          processedContent !== userNote &&
+          !attachmentLlmPayload.includes(processedContent)
+        ) {
+          apiUserInput = `${processedContent}\n\n---\n\n${attachmentLlmPayload}`;
+        } else {
+          apiUserInput = attachmentLlmPayload;
+        }
+      }
+
+      const { freshTopic, topicFusionContext } = await fetchTopicFusionContext(
         selectedTopic,
+        topics,
+        userNote || apiUserInput,
+        sessionId,
+        messages,
+        activeSkillIds
+      );
+
+      const apiMessages = buildMessages(
+        apiUserInput,
+        freshTopic,
         messages,
         topicInstructions,
         knowledgeItems,
@@ -2176,16 +2613,18 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         skillConfigs,
         selectedPromptObjects,
         personalityPrompt,
-        processedContent, // 传递用户输入用于向量召回
-        knowledgeRagContext
+        userNote || apiUserInput, // 向量召回用用户短句
+        knowledgeRagContext,
+        { excludeMessageIds: [userMessage.id], topicFusionContext }
       );
 
       userRowForPersistence = {
         ...userMessage,
         metadata: {
           ...(userMessage.metadata || {}),
-          user_visible_input: content.trim(),
-          llm_expanded_char_count: processedContent.length
+          user_visible_input: userNote,
+          llm_expanded_char_count: apiUserInput.length,
+          attached_files: attachmentNames.length > 0 ? attachmentNames : undefined
         }
       };
       setMessages((prev) =>
@@ -2195,7 +2634,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       // 预检：缺 apiKey / 推理服务不可达 / KGM 三种路径都没工作 等问题直接告知用户。
       // 注意：前端不替 KGM 决策路由；KGM 的"推理引擎路由 / 模型路由 / 原生推理"由 KGM 自己选。
       try {
-        const preflight = await apiService.runChatPreflight(selectedModel);
+        const preflight = await apiService.runChatPreflight(resolvedChatRequestModel);
         if (!preflight.ok) {
           const errorIssues = preflight.issues.filter(i => i.severity === 'error');
           const warnIssues = preflight.issues.filter(i => i.severity === 'warn');
@@ -2238,7 +2677,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
             time: new Date().toLocaleTimeString(),
             isThinking: false,
             provider: selectedProvider,
-            model: selectedModel,
+            model: resolvedChatRequestModel,
             status: 'failed' as const,
             error: {
               message: '聊天预检失败',
@@ -2260,10 +2699,10 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
           return;
         }
         if (import.meta.env.DEV) {
-          console.log('✅ 聊天预检通过', preflight.resolved);
+          devLog('✅ 聊天预检通过', preflight.resolved);
         }
       } catch (preflightError) {
-        console.warn('聊天预检异常（不阻断主流程）:', preflightError);
+        devWarn('聊天预检异常（不阻断主流程）:', preflightError);
       }
 
       const streamStateRef = { current: createInitialStreamReducerState() };
@@ -2271,8 +2710,22 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       const wrappedToolCallHandler = makePermissionAwareToolCallHandler(toolCallHandler);
 
       // 使用新的API调用方式发送消息（支持 function calling）
+      let outboundModel = selectedModel;
+      if (attachmentLlmPayload && selectedProvider === 'kgm') {
+        const catalog = await fetchKgmModelCatalog(chatRuntimeSnap.kgmHttpRootDisplay);
+        const picked = await pickAttachmentChatModel(
+          selectedModel,
+          catalog,
+          chatRuntimeSnap.kgmHttpRootDisplay
+        );
+        outboundModel = picked.model;
+        if (picked.reason) {
+          toast(picked.reason, { duration: 6000 });
+        }
+      }
+
       const mainSendRes = await sendOllamaMessageWithMessages(
-        selectedModel,
+        outboundModel,
         apiMessages,
         (data) => {
           const evt = normalizeRawStreamEvent(data);
@@ -2308,7 +2761,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
               time: new Date().toLocaleTimeString(),
               isThinking: true,
               provider: selectedProvider,
-              model: selectedModel,
+              model: resolvedChatRequestModel,
               reasoningContent: streamStateRef.current.reasoningContent || undefined,
               toolCallRecords: streamStateRef.current.toolCallRecords,
               thinkingRecords: streamStateRef.current.thinkingRecords,
@@ -2322,19 +2775,62 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
             });
           }
         },
-        { tools, toolCallHandler: wrappedToolCallHandler, enabledSkillIds: activeSkillIds }
+        {
+          tools,
+          toolCallHandler: wrappedToolCallHandler,
+          enabledSkillIds: activeSkillIds,
+          kgmRequestHints: {
+            compactAttachmentChat: Boolean(attachmentLlmPayload)
+          }
+        }
       );
-      const mainInvocationMetrics = extractInvocationMetrics(mainSendRes);
+      const mainInvocationMetrics = extractInvocationMetrics(mainSendRes, routePlan);
+
+      // 取消未执行的防抖更新，避免最终态与流式 patch 竞态；并用 API 层汇总结果回填（防 SSE 去重等导致 reducer 漏字）
+      if (updateTimer) {
+        clearTimeout(updateTimer);
+        updateTimer = null;
+      }
+      const apiRound = mainSendRes && typeof mainSendRes === 'object' ? mainSendRes : {};
+      let resolvedContent =
+        streamStateRef.current.accumulatedContent ||
+        (typeof apiRound.content === 'string' ? apiRound.content : '') ||
+        '';
+      const resolvedReasoning =
+        streamStateRef.current.reasoningContent ||
+        (typeof apiRound.reasoningContent === 'string' ? apiRound.reasoningContent : '') ||
+        undefined;
+      const resolvedThinkingFromApi =
+        typeof apiRound.thinkingContent === 'string' && apiRound.thinkingContent.trim()
+          ? apiRound.thinkingContent
+          : '';
+      const resolvedThinkingRecords =
+        streamStateRef.current.thinkingRecords.length > 0
+          ? streamStateRef.current.thinkingRecords
+          : resolvedThinkingFromApi
+            ? [{ content: resolvedThinkingFromApi, timestamp: Date.now() }]
+            : undefined;
+
+      resolvedContent = pickAssistantVisibleRawText({
+        accumulatedContent: resolvedContent,
+        toolCallRecords: streamStateRef.current.toolCallRecords,
+        reasoningContent: resolvedReasoning,
+        thinkingContent: resolvedThinkingFromApi,
+        thinkingRecords: streamStateRef.current.thinkingRecords,
+        completionTokens: mainInvocationMetrics?.completionTokens,
+        totalLatencyMs: mainInvocationMetrics?.totalLatencyMs
+      });
+      resolvedContent = finalizeKgmAssistantMarkdownIfNeeded(resolvedContent);
 
       // 确保最终内容被更新
       setMessages(prev => prev.map(msg =>
         msg.id === botMessageIdRef.current ? {
           ...msg,
-          content: streamStateRef.current.accumulatedContent,
+          content: resolvedContent,
           isThinking: false,
-          reasoningContent: streamStateRef.current.reasoningContent || undefined,
+          reasoningContent: resolvedReasoning,
+          thinkingRecords: resolvedThinkingRecords,
           toolCallRecords: streamStateRef.current.toolCallRecords,
-          thinkingRecords: streamStateRef.current.thinkingRecords,
           sources: streamStateRef.current.sources.length ? streamStateRef.current.sources : undefined,
           permissionAuditTrail:
             permissionAuditForBotRef.current.length > 0
@@ -2349,15 +2845,15 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       const finalBotMessage = {
         id: botMessageIdRef.current,
         role: 'bot',
-        content: streamStateRef.current.accumulatedContent,
+        content: resolvedContent,
         sender: 'Yueli Copilot',
         time: new Date().toLocaleTimeString(),
         isThinking: false,
         provider: selectedProvider,
-        model: selectedModel,
-        reasoningContent: streamStateRef.current.reasoningContent || undefined,
+        model: resolvedChatRequestModel,
+        reasoningContent: resolvedReasoning,
         toolCallRecords: streamStateRef.current.toolCallRecords,
-        thinkingRecords: streamStateRef.current.thinkingRecords,
+        thinkingRecords: resolvedThinkingRecords,
         sources: streamStateRef.current.sources.length ? streamStateRef.current.sources : undefined,
         permissionAuditTrail:
           permissionAuditForBotRef.current.length > 0 ? [...permissionAuditForBotRef.current] : undefined,
@@ -2370,6 +2866,19 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         return [...withoutCurrentBot, { ...userRowForPersistence, status: 'sent' as const }, finalBotMessage];
       });
 
+      void appendSessionMemoryTurn({
+        sessionId,
+        userId: 'default',
+        role: 'user',
+        content: userNote
+      });
+      void appendSessionMemoryTurn({
+        sessionId,
+        userId: 'default',
+        role: 'assistant',
+        content: resolvedContent.slice(0, 8000)
+      });
+
       // 将对话添加到历史会话：占位名「新对话」须在首条消息成功后替换为 AI 标题
       const existingSession = sessions.find(s => s.id === sessionId);
       let sessionName: string;
@@ -2379,7 +2888,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         sessionTopicId = existingSession.topicId || null;
       } else {
         try {
-          sessionName = (await apiService.generateTitle(content, selectedModel)).trim();
+          sessionName = (await apiService.generateTitle(content, resolvedChatRequestModel)).trim();
         } catch (error) {
           sessionName = generateRuleBasedTitle(content);
         }
@@ -2401,7 +2910,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       if (success) {
         // 更新 React 状态
         setSessions(sessionStorageService.getAll());
-        console.log('💾 会话更新成功:', {
+        devLog('💾 会话更新成功:', {
           sessionId,
           sessionName,
           sessionTopicId,
@@ -2409,7 +2918,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
           status: sessionStorageService.status
         });
       } else {
-        console.error('❌ 会话更新失败');
+        devError('❌ 会话更新失败');
       }
 
       // 更新用户消息状态为已发送
@@ -2421,7 +2930,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
   } catch (err: any) {
     const errorText = err?.message || String(err) || '未知错误';
     const errorCode = err?.code || err?.name || '';
-    console.error('[handleSendMessage] LLM 调用失败:', { sessionId, errorCode, errorText, err });
+    devError('[handleSendMessage] LLM 调用失败:', { sessionId, errorCode, errorText, err });
     setError(`发送消息失败：${errorText}`);
     toast.error(`发送消息失败：${errorText}`);
 
@@ -2434,7 +2943,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
     const errorBanner =
       `\n\n❌ **请求失败**：${errorText}` +
       (errorCode ? ` (\`${errorCode}\`)` : '') +
-      `\n\n> 该消息没有完整返回，您可以重新发送，或在浏览器控制台运行 \`debugYueli.session('${sessionId}')\` 查看明细。`;
+      `\n\n> 该消息没有完整返回，您可以重新发送。Mac 应用：顶部**调试工具栏**→「开发者工具」，在 Console 执行 \`debugYueli.session('${sessionId}')\`（支持粘贴）。`;
     const finalContent = partialContent
       ? `${partialContent}${errorBanner}`
       : errorBanner.replace(/^\n\n/, '');
@@ -2447,7 +2956,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       time: new Date().toLocaleTimeString(),
       isThinking: false,
       provider: selectedProvider,
-      model: selectedModel,
+      model: resolvedChatRequestModel,
       reasoningContent: reasoningContentRef.current || undefined,
       sources: sourcesRef.current.length > 0 ? sourcesRef.current : undefined,
       permissionAuditTrail:
@@ -2601,7 +3110,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
   };
 
   const handleSearchButtonClick = () => {
-    setIsSearchModalOpen(true);
+    openExclusiveOverlay('search');
     setSearchQueryGlobal('');
     setSearchResults([]);
   };
@@ -2670,7 +3179,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
   // 处理文件上传
   const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const uploadedFiles = event.target.files;
-    if (uploadedFiles) {
+    if (uploadedFiles?.length) {
       const newFiles: ChatFile[] = Array.from(uploadedFiles).map(file => ({
         id: `file-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
         name: file.name,
@@ -2679,7 +3188,10 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         file
       }));
       setFiles(prev => [...prev, ...newFiles]);
+      setIsAddMenuOpen(false);
     }
+    event.target.value = '';
+    isPickingFilesRef.current = false;
   };
 
   // 处理删除文件
@@ -2718,7 +3230,11 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       }
     }
     // 确保从sessionMessages中加载消息
-    const sessionData = sessionMessages[session.id] || [];
+    const sessionData = persistNormalizedSessionMessages(
+      session.id,
+      sessionMessages[session.id] || []
+    );
+    setSessionMessages((prev) => ({ ...prev, [session.id]: sessionData }));
     setMessages(sessionData);
     setInput('');
     setFiles([]);
@@ -2735,7 +3251,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       lastActive: Date.now()
     };
     
-    console.log('🆕 创建新会话:', {
+    devLog('🆕 创建新会话:', {
       sessionId,
       selectedTopicId: selectedTopic?.id,
       topicId: newSession.topicId,
@@ -2747,14 +3263,14 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
     const success = sessionStorageService.add(newSession);
     
     if (success) {
-      console.log('✅ 会话创建成功:', {
+      devLog('✅ 会话创建成功:', {
         sessionId,
         status: sessionStorageService.status
       });
       // 更新 React 状态
       setSessions(sessionStorageService.getAll());
     } else {
-      console.error('❌ 会话创建失败，请检查存储');
+      devError('❌ 会话创建失败，请检查存储');
       setError('会话创建失败，请刷新页面重试');
       return;
     }
@@ -2790,7 +3306,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
 
   // 处理点击历史会话（非项目主题）
   const handleHistorySessionClick = (session: any) => {
-    console.log('📍 点击历史会话:', {
+    devLog('📍 点击历史会话:', {
       session,
       selectedTopic: selectedTopic,
       currentSessionId
@@ -2799,11 +3315,15 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
     setCurrentSessionId(session.id);
     setViewMode('chat');
     // 确保从sessionMessages中加载消息
-    const sessionData = sessionMessages[session.id] || [];
-    console.log('📥 从 sessionMessages 加载消息:', {
+    const sessionData = persistNormalizedSessionMessages(
+      session.id,
+      sessionMessages[session.id] || []
+    );
+    devLog('📥 从 sessionMessages 加载消息:', {
       sessionId: session.id,
       sessionDataLength: sessionData.length
     });
+    setSessionMessages((prev) => ({ ...prev, [session.id]: sessionData }));
     setMessages(sessionData);
     setInput('');
     setFiles([]);
@@ -2816,12 +3336,12 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       // 初始化已选择的指令
       const topicInstructionIds = selectedTopic.instructions || [];
       setSelectedInstructions(topicInstructionIds);
-      setIsInstructionModalOpen(true);
+      openExclusiveOverlay('instruction');
     }
   };
 
   const handleAddInstruction = () => {
-    setIsAddInstructionModalOpen(true);
+    openExclusiveOverlay('addInstruction');
   };
 
   const handleCreateInstruction = () => {
@@ -2873,8 +3393,8 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         <button 
           onClick={() => setIsSidebarExpanded(true)}
           style={{
-            width: '40px',
-            height: '40px',
+            width: '60px',
+            height: '60px',
             borderRadius: '0 8px 8px 0',
             backgroundColor: '#ffffff',
             border: '1px solid #e8e8e8',
@@ -2894,7 +3414,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       )}
       
       <Sidebar style={{ 
-        width: isSidebarExpanded ? '240px' : '0', 
+        width: isSidebarExpanded ? '300px' : '0', 
         backgroundColor: '#ffffff', 
         borderRight: isSidebarExpanded ? '1px solid #e8e8e8' : 'none',
         overflow: 'hidden',
@@ -2919,7 +3439,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                     alignItems: 'center',
                     justifyContent: 'center'
                   }}
-                  onClick={() => setIsHistorySearchModalOpen(true)}
+                  onClick={() => openExclusiveOverlay('historySearch')}
                   title="搜索历史会话"
                 >
                   <SearchOutlined />
@@ -2981,7 +3501,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                     fontSize: '12px',
                     transition: 'all 0.2s ease'
                   }}
-                  onClick={() => setIsCreateTopicModalOpen(true)}
+                  onClick={() => openExclusiveOverlay('createTopic')}
                 >
                   + 新主题
                 </button>
@@ -3199,7 +3719,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                     fontSize: '16px',
                     fontWeight: '500'
                   }}
-                  onClick={() => setIsCreateTopicModalOpen(true)}
+                  onClick={() => openExclusiveOverlay('createTopic')}
                 >
                   + 创建新项目主题
                 </button>
@@ -3402,8 +3922,8 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                 >
                   ← 返回
                 </button>
-                <div style={{ display: 'flex', flexDirection: 'column', flex: 1 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '12px', minWidth: 0 }}>
                     {selectedTopic && (
                       <div style={{
                         fontSize: '14px',
@@ -3430,7 +3950,10 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                   <ActionButton onClick={() => navigate('/manager')} style={{ borderRadius: '8px', borderColor: '#1890ff', color: '#1890ff' }}>
                     <AppstoreOutlined /> 管理中心
                   </ActionButton>
-                  <ActionButton onClick={() => setIsApiConfigModalOpen(true)} style={{ borderRadius: '8px' }}>
+                  <ActionButton
+                    onClick={() => toggleExclusiveOverlay('apiConfig', isApiConfigModalOpen)}
+                    style={{ borderRadius: '8px' }}
+                  >
                     <SettingOutlined /> 配置
                   </ActionButton>
                   <ActionButton onClick={() => navigate('/manager')} style={{ borderRadius: '8px' }}>
@@ -3521,7 +4044,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                       transition: 'all 0.2s ease',
                       flexShrink: 0
                     }}
-                    onClick={() => setIsPromptConfigModalOpen(true)}
+                    onClick={() => openExclusiveOverlay('promptConfig')}
                   >
                     配置
                   </button>
@@ -3568,100 +4091,49 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                 </div>
               )}
               
-              {/* 输入区域 - 参考openwebui设计 */}
+              {/* 输入区域：上为全宽文本区（避免 +/听写与 textarea 同列造成左侧大块留白），下为工具栏 */}
               <div style={{
                 display: 'flex',
-                alignItems: 'flex-end',
-                gap: '0px',
+                flexDirection: 'column',
                 marginBottom: '8px',
                 borderRadius: '8px',
                 backgroundColor: '#ffffff',
                 boxShadow: '0 1px 2px rgba(0, 0, 0, 0.05)',
-                minHeight: '60px'
+                minWidth: 0,
+                maxWidth: '100%',
+                width: '100%',
+                overflow: 'hidden'
               }}>
-                {/* 左侧 Tools 菜单（替代固定底部下拉） */}
-                <div style={{ position: 'relative', zIndex: 9999 }}>
-                  <Popover
-                    open={isAddMenuOpen}
-                    onOpenChange={setIsAddMenuOpen}
-                    placement="topLeft"
-                    trigger="click"
-                    content={
-                      <ToolsMenu
-                        skills={skills}
-                        activeSkillIds={activeSkillIds}
-                        onToggleSkill={handleToggleSkill}
-                        modelOptions={modelOptions}
-                        selectedProvider={selectedProvider as ChatProvider}
-                        selectedModel={selectedModel}
-                        onChangeProviderModel={(provider, model) => {
-                          setSelectedProvider(provider);
-                          setSelectedModel(model);
-                        }}
-                        onUploadFiles={() => {
-                          fileInputRef.current?.click();
-                          setIsAddMenuOpen(false);
-                        }}
-                        knowledgeItemCount={knowledgeItems.length}
-                        selectedPromptsCount={selectedPrompts.length}
-                        lastToolRoundSkillIds={lastToolRoundSkillIds}
-                        onOpenKnowledgeSelection={() => {
-                          setIsKnowledgeModalOpen(true);
-                          setIsAddMenuOpen(false);
-                        }}
-                        onOpenPromptTemplates={() => {
-                          setIsPromptConfigModalOpen(true);
-                          setIsAddMenuOpen(false);
-                        }}
-                        installSkillFromUrl={installSkillFromUrl}
-                        onHubSkillInstalled={handleHubSkillInstalled}
-                        onSyncToolRoutingIndex={handleSyncToolRoutingIndex}
-                        defaultTabKey={toolsMenuDefaultTab}
-                        allowSkillEntry={allowSkillEntry}
-                        onAllowSkillEntryChange={handleAllowSkillEntryChange}
-                        allowSkillRuntime={allowSkillRuntime}
-                        onAllowSkillRuntimeChange={handleAllowSkillRuntimeChange}
-                        streamIncludeUsage={streamIncludeUsageUi}
-                        onStreamIncludeUsageChange={handleStreamIncludeUsageChange}
-                        streamIncludeUsageHasLocalOverride={streamUsageOverridePresent}
-                        onResetStreamIncludeUsageDefault={handleResetStreamIncludeUsageDefault}
-                        knowledgeScope={knowledgeScopeUi}
-                        onKnowledgeScopeChange={handleKnowledgeScopeChange}
-                      />
-                    }
-                  >
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setToolsMenuDefaultTab('attachments');
-                        setIsAddMenuOpen(!isAddMenuOpen);
-                      }}
+                {/* 文本区（全宽） */}
+                <div style={{ flex: 1, minWidth: 0, minHeight: '100px', display: 'flex', flexDirection: 'column' }}>
+                  <div style={{ padding: '6px 10px 0' }}>
+                    <SkillRoundPlanPanel
+                      activeSkillIds={activeSkillIds}
+                      skillNames={skillNamesMap}
+                      toolsInjectedInSystem={activeSkillIds.length > 0}
+                      openAiToolsSent={composerOpenAiToolsSent}
+                      evolutionEnabled={isSkillEvolutionEnabled()}
+                    />
+                    <ContextBudgetPanel recentMessages={messages} compact />
+                  </div>
+                  {voiceInterimDisplay ? (
+                    <div
                       style={{
-                        background: 'transparent',
-                        border: 'none',
+                        padding: '4px 12px',
+                        fontSize: '14px',
                         color: '#666',
-                        padding: '12px',
-                        cursor: 'pointer',
-                        display: 'flex',
-                        alignItems: 'flex-end',
-                        justifyContent: 'center',
-                        fontSize: '16px',
-                        borderRadius: '8px 0 0 8px',
-                        transition: 'background-color 0.2s'
+                        fontStyle: 'italic',
+                        lineHeight: 1.35,
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        flexShrink: 0,
+                        minWidth: 0
                       }}
-                      onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#f5f5f5')}
-                      onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
-                      title="工具与设置"
                     >
-                      <Badge count={activeSkillIds.length} size="small" offset={[2, -2]}>
-                        <span style={{ display: 'inline-block', width: 14 }}>+</span>
-                      </Badge>
-                    </button>
-                  </Popover>
-                </div>
-                
-                {/* 文本输入框 */}
-                <div style={{ flex: 1, minHeight: '100px' }}>
+                      识别中：{voiceInterimDisplay}
+                    </div>
+                  ) : null}
                   <textarea
                     data-testid="chat-input"
                     ref={textAreaRef}
@@ -3674,11 +4146,14 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                         handleSendMessage(input, files);
                       }
                     }}
-                    placeholder="输入消息... (支持粘贴图片)"
+                    placeholder="输入消息…（支持粘贴图片；底部工具栏听写为浏览器语音识别）"
                     disabled={isLoading}
                     rows={5}
                     style={{
                       width: '100%',
+                      maxWidth: '100%',
+                      minWidth: 0,
+                      boxSizing: 'border-box',
                       padding: '8px 12px',
                       border: 'none',
                       resize: 'none',
@@ -3688,106 +4163,229 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                       fontFamily: 'inherit',
                       lineHeight: '1.6',
                       backgroundColor: 'transparent',
-                      color: '#333'
+                      color: '#333',
+                      overflowWrap: 'break-word',
+                      wordBreak: 'break-word'
                     }}
                   />
                 </div>
-                
-                {/* 右侧模型按钮与发送按钮 */}
-                <div style={{ display: 'flex', alignItems: 'flex-end', gap: '8px', padding: '0 12px 0 0' }}>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setToolsMenuDefaultTab('skills');
-                      setIsAddMenuOpen(true);
-                    }}
+
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  multiple
+                  style={{ display: 'none' }}
+                  onChange={handleFileUpload}
+                />
+                {/* 底栏：工具 + 模型/发送 */}
+                <div
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '8px',
+                    minWidth: 0,
+                    borderTop: '1px solid #f0f0f0',
+                    padding: '4px 4px 8px 4px'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', flexShrink: 0 }}>
+                    <div style={{ position: 'relative', zIndex: 1001, flexShrink: 0 }}>
+                      <Popover
+                        open={isAddMenuOpen}
+                        onOpenChange={(open) => {
+                          if (!open && isPickingFilesRef.current) return;
+                          if (open) {
+                            openExclusiveOverlay('addMenu');
+                          } else {
+                            setIsAddMenuOpen(false);
+                          }
+                        }}
+                        placement="topLeft"
+                        trigger={[]}
+                        destroyOnHidden={false}
+                        content={
+                          <div
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                          <ToolsMenu
+                            skills={skills}
+                            activeSkillIds={activeSkillIds}
+                            onToggleSkill={handleToggleSkill}
+                            modelOptions={modelOptions}
+                            selectedProvider={selectedProvider as ChatProvider}
+                            selectedModel={selectedModel}
+                            onChangeProviderModel={(provider, model) => {
+                              setSelectedProvider(provider);
+                              setSelectedModel(model);
+                              localStorage.setItem('selectedProvider', provider);
+                              localStorage.setItem('selectedModel', model);
+                            }}
+                            onPrepareFilePick={beginFilePick}
+                            onUploadFiles={handleToolsMenuUploadFiles}
+                            knowledgeItemCount={knowledgeItems.length}
+                            selectedPromptsCount={selectedPrompts.length}
+                            lastToolRoundSkillIds={lastToolRoundSkillIds}
+                            onOpenKnowledgeSelection={() => {
+                              openExclusiveOverlay('knowledge');
+                            }}
+                            onOpenChatDocuments={() => {
+                              openExclusiveOverlay('chatDocuments');
+                            }}
+                            onOpenPromptTemplates={() => {
+                              openExclusiveOverlay('promptConfig');
+                            }}
+                            installSkillFromUrl={installSkillFromUrl}
+                            onHubSkillInstalled={handleHubSkillInstalled}
+                            onSyncToolRoutingIndex={handleSyncToolRoutingIndex}
+                            defaultTabKey={toolsMenuDefaultTab}
+                            allowSkillEntry={allowSkillEntry}
+                            onAllowSkillEntryChange={handleAllowSkillEntryChange}
+                            allowSkillRuntime={allowSkillRuntime}
+                            onAllowSkillRuntimeChange={handleAllowSkillRuntimeChange}
+                            streamIncludeUsage={streamIncludeUsageUi}
+                            onStreamIncludeUsageChange={handleStreamIncludeUsageChange}
+                            streamIncludeUsageHasLocalOverride={streamUsageOverridePresent}
+                            onResetStreamIncludeUsageDefault={handleResetStreamIncludeUsageDefault}
+                            knowledgeScope={knowledgeScopeUi}
+                            onKnowledgeScopeChange={handleKnowledgeScopeChange}
+                          />
+                          </div>
+                        }
+                      >
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setToolsMenuDefaultTab('attachments');
+                            toggleExclusiveOverlay('addMenu', isAddMenuOpen);
+                          }}
+                          style={{
+                            background: 'transparent',
+                            border: 'none',
+                            color: '#666',
+                            padding: '12px',
+                            cursor: 'pointer',
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            fontSize: '16px',
+                            borderRadius: '6px',
+                            transition: 'background-color 0.2s'
+                          }}
+                          onMouseEnter={(e) => (e.currentTarget.style.backgroundColor = '#f5f5f5')}
+                          onMouseLeave={(e) => (e.currentTarget.style.backgroundColor = 'transparent')}
+                          title="工具与设置"
+                        >
+                          <Badge count={activeSkillIds.length} size="small" offset={[2, -2]}>
+                            <span style={{ display: 'inline-block', width: 14 }}>+</span>
+                          </Badge>
+                        </button>
+                      </Popover>
+                    </div>
+
+                    <ChatVoiceMicButton
+                      appendTranscript={appendVoiceTranscript}
+                      onInterimChange={handleVoiceInterim}
+                      disabled={isLoading}
+                    />
+                  </div>
+
+                  <div
                     style={{
-                      background: '#f5f5f5',
-                      border: '1px solid #e8e8e8',
-                      color: '#333',
-                      padding: '6px 10px',
-                      borderRadius: '6px',
-                      fontSize: '12px',
-                      outline: 'none',
-                      cursor: 'pointer',
-                      maxWidth: '220px',
-                      whiteSpace: 'nowrap',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis'
+                      flex: 1,
+                      minWidth: 0
                     }}
-                    title="查看/调整本轮启用的 Skills 与 Tools"
-                  >
-                    Skills {activeSkillIds.length} · Tools {enabledToolsCount}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setToolsMenuDefaultTab('model');
-                      setIsAddMenuOpen(true);
-                    }}
-                    style={{
-                      background: '#f5f5f5',
-                      border: '1px solid #e8e8e8',
-                      color: '#333',
-                      padding: '6px 10px',
-                      borderRadius: '6px',
-                      fontSize: '12px',
-                      outline: 'none',
-                      cursor: 'pointer',
-                      maxWidth: '220px',
-                      whiteSpace: 'nowrap',
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis'
-                    }}
-                    title="切换模型/Provider"
-                  >
-                    {selectedProvider}:{selectedModel}
-                  </button>
-                  
-                  {/* 发送按钮 */}
-                  <button
-                    type="button"
-                    onClick={() => handleSendMessage(input, files)}
-                    disabled={!input.trim() || isLoading}
-                    style={{
-                      background: input.trim() && !isLoading ? '#1890ff' : '#d9d9d9',
-                      border: 'none',
-                      color: '#fff',
-                      padding: '8px 16px',
-                      cursor: input.trim() && !isLoading ? 'pointer' : 'not-allowed',
-                      borderRadius: '4px',
-                      fontSize: '14px',
-                      fontWeight: 500,
-                      transition: 'all 0.2s'
-                    }}
-                    onMouseEnter={(e) => {
-                      if (input.trim() && !isLoading) {
-                        e.currentTarget.style.backgroundColor = '#40a9ff';
-                      }
-                    }}
-                    onMouseLeave={(e) => {
-                      if (input.trim() && !isLoading) {
-                        e.currentTarget.style.backgroundColor = '#1890ff';
-                      }
-                    }}
-                  >
-                    {isLoading ? (
-                      <span style={{ display: 'flex', alignItems: 'center' }}>
-                        <span style={{ marginRight: '8px' }}>发送中...</span>
-                        <span style={{ 
-                          display: 'inline-block', 
-                          width: '12px', 
-                          height: '12px', 
-                          border: '2px solid #fff', 
-                          borderTop: '2px solid transparent', 
-                          borderRadius: '50%', 
-                          animation: 'spin 1s linear infinite'
-                        }}></span>
-                      </span>
-                    ) : (
-                      '发送'
-                    )}
-                  </button>
+                  />
+
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+                    <button
+                      type="button"
+                      onClick={() => openToolsMenuTab('skills')}
+                      style={{
+                        background: '#f5f5f5',
+                        border: '1px solid #e8e8e8',
+                        color: '#333',
+                        padding: '6px 10px',
+                        borderRadius: '6px',
+                        fontSize: '12px',
+                        outline: 'none',
+                        cursor: 'pointer',
+                        maxWidth: '220px',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis'
+                      }}
+                      title="查看/调整本轮启用的 Skills 与 Tools"
+                    >
+                      Skills {activeSkillIds.length} · Tools {enabledToolsCount}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openToolsMenuTab('model')}
+                      style={{
+                        background: '#f5f5f5',
+                        border: '1px solid #e8e8e8',
+                        color: '#333',
+                        padding: '6px 10px',
+                        borderRadius: '6px',
+                        fontSize: '12px',
+                        outline: 'none',
+                        cursor: 'pointer',
+                        maxWidth: '220px',
+                        whiteSpace: 'nowrap',
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis'
+                      }}
+                      title={`切换模型/Provider（当前解析：${chatRuntimeBadge}）`}
+                    >
+                      {chatRuntimeBadge}
+                    </button>
+
+                    {/* 发送按钮 */}
+                    <button
+                      type="button"
+                      onClick={() => handleSendMessage(input, files)}
+                      disabled={!input.trim() || isLoading}
+                      style={{
+                        background: input.trim() && !isLoading ? '#1890ff' : '#d9d9d9',
+                        border: 'none',
+                        color: '#fff',
+                        padding: '8px 16px',
+                        cursor: input.trim() && !isLoading ? 'pointer' : 'not-allowed',
+                        borderRadius: '4px',
+                        fontSize: '14px',
+                        fontWeight: 500,
+                        transition: 'all 0.2s'
+                      }}
+                      onMouseEnter={(e) => {
+                        if (input.trim() && !isLoading) {
+                          e.currentTarget.style.backgroundColor = '#40a9ff';
+                        }
+                      }}
+                      onMouseLeave={(e) => {
+                        if (input.trim() && !isLoading) {
+                          e.currentTarget.style.backgroundColor = '#1890ff';
+                        }
+                      }}
+                    >
+                      {isLoading ? (
+                        <span style={{ display: 'flex', alignItems: 'center' }}>
+                          <span style={{ marginRight: '8px' }}>发送中...</span>
+                          <span style={{
+                            display: 'inline-block',
+                            width: '12px',
+                            height: '12px',
+                            border: '2px solid #fff',
+                            borderTop: '2px solid transparent',
+                            borderRadius: '50%',
+                            animation: 'spin 1s linear infinite'
+                          }}></span>
+                        </span>
+                      ) : (
+                        '发送'
+                      )}
+                    </button>
+                  </div>
                 </div>
               </div>
               
@@ -3810,8 +4408,8 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         <button 
           onClick={() => setIsSkillsExpanded(true)}
           style={{
-            width: '40px',
-            height: '40px',
+            width: '60px',
+            height: '60px',
             borderRadius: '8px 0 0 8px',
             backgroundColor: '#ffffff',
             border: '1px solid #e8e8e8',
@@ -3831,7 +4429,8 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
       )}
       
       <div style={{ 
-        width: isSkillsExpanded ? '240px' : '0', 
+        flexShrink: 0,
+        width: isSkillsExpanded ? '280px' : '0', 
         backgroundColor: '#ffffff', 
         borderLeft: isSkillsExpanded ? '1px solid #e8e8e8' : 'none',
         padding: isSkillsExpanded ? '20px' : '0',
@@ -3869,7 +4468,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                     alignItems: 'center',
                     padding: '4px'
                   }}
-                  onClick={() => setIsSearchModalOpen(true)}
+                  onClick={() => openExclusiveOverlay('search')}
                   title="搜索技能和快速提示"
                 >
                   <SearchOutlined />
@@ -3972,6 +4571,13 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
         onClose={() => setIsKnowledgeModalOpen(false)}
         selectedKnowledge={selectedKnowledge}
         onSelectKnowledge={setSelectedKnowledge}
+      />
+
+      <ChatDocumentsModal
+        isOpen={isChatDocumentsModalOpen}
+        onClose={() => setIsChatDocumentsModalOpen(false)}
+        sessionId={currentSessionId}
+        userId="default"
       />
 
       {/* 创建主题模态框 */}
@@ -4217,7 +4823,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                   );
                   
                   if (import.meta.env.DEV) {
-                    console.log('📁 文件读取完成:', filesWithContent.map(f => ({
+                    devLog('📁 文件读取完成:', filesWithContent.map(f => ({
                       name: f.name,
                       contentLength: f.content?.length || 0
                     })));
@@ -4232,7 +4838,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                     lastActive: Date.now()
                   };
                   
-                  console.log('📦 准备保存新主题:', {
+                  devLog('📦 准备保存新主题:', {
                     id: newTopic.id,
                     name: newTopic.name,
                     files: newTopic.files.map(f => ({
@@ -4570,9 +5176,9 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                     if (success) {
                       // 更新 React 状态
                       setSessions(sessionStorageService.getAll());
-                      console.log('🗑️ 会话删除成功:', menuItem.id);
+                      devLog('🗑️ 会话删除成功:', menuItem.id);
                     } else {
-                      console.error('❌ 会话删除失败');
+                      devError('❌ 会话删除失败');
                     }
                     
                     // 同时删除会话消息
@@ -4584,7 +5190,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                         localStorage.setItem('yueli_session_messages', JSON.stringify(allMessages));
                       }
                     } catch (error) {
-                      console.error('删除会话消息失败:', error);
+                      devError('删除会话消息失败:', error);
                     }
                     // 如果删除的是当前会话，返回会话列表
                     if (currentSessionId === menuItem.id) {
@@ -4936,7 +5542,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                   // 重命名功能
                   setActiveMenu(null);
                   setRenameNewName(menuItem.name);
-                  setIsRenameModalOpen(true);
+                  openExclusiveOverlay('rename');
                 }}
               >
                 ✏️ 重命名
@@ -4980,7 +5586,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                     document.body.removeChild(a);
                     URL.revokeObjectURL(url);
                   } catch (error) {
-                    console.error('导出JSON失败:', error);
+                    devError('导出JSON失败:', error);
                   }
                 }}
               >
@@ -5035,7 +5641,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                     document.body.removeChild(a);
                     URL.revokeObjectURL(url);
                   } catch (error) {
-                    console.error('导出Markdown失败:', error);
+                    devError('导出Markdown失败:', error);
                   }
                 }}
               >
@@ -5056,19 +5662,25 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                   fontSize: '14px',
                   transition: 'all 0.2s ease'
                 }}
-                onClick={() => {
+                onClick={async () => {
                   // 分享功能 - 生成会话URL
                   try {
                     // 构建当前页面URL并添加会话ID参数
                     const url = new URL(window.location.href);
                     url.searchParams.set('session', menuItem.id);
                     const shareUrl = url.toString();
-                    
-                    navigator.clipboard.writeText(shareUrl);
-                    alert('会话链接已复制到剪贴板！');
+
+                    await navigator.clipboard.writeText(shareUrl);
+                    toast.success('会话链接已复制到剪贴板', {
+                      position: 'bottom-center',
+                      duration: 2200
+                    });
                   } catch (error) {
-                    console.error('分享失败:', error);
-                    alert('复制链接失败，请手动复制。');
+                    devError('分享失败:', error);
+                    toast.error('复制链接失败，请手动复制', {
+                      position: 'bottom-center',
+                      duration: 2800
+                    });
                   }
                   setActiveMenu(null);
                 }}
@@ -5094,7 +5706,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                 onClick={() => {
                   // 打开删除确认模态框
                   setActiveMenu(null);
-                  setIsDeleteConfirmOpen(true);
+                  openExclusiveOverlay('deleteConfirm');
                 }}
               >
                 🗑️ 删除
@@ -5589,7 +6201,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                           alert(`技能安装或测试失败: ${testResult.message}`);
                         }
                       } catch (error) {
-                        console.error('安装技能失败:', error);
+                        devError('安装技能失败:', error);
                         alert('安装技能失败，请重试');
                       }
                     }
@@ -5641,7 +6253,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                       const skillInstaller = orchestrator.getSkillInstaller();
                       
                       // 步骤 1: 从 URL 发现技能
-                      console.log('正在发现技能...');
+                      devLog('正在发现技能...');
                       const discoveredSkills = await skillInstaller.discoverSkillsFromUrl(skillUrl);
                       
                       if (discoveredSkills.length === 0) {
@@ -5649,11 +6261,11 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                         return;
                       }
                       
-                      console.log(`发现 ${discoveredSkills.length} 个技能`);
+                      devLog(`发现 ${discoveredSkills.length} 个技能`);
                       
                       // 步骤 2: 安装并测试每个发现的技能（这里简单取第一个）
                       const skillToInstall = discoveredSkills[0];
-                      console.log('正在安装技能:', skillToInstall.name);
+                      devLog('正在安装技能:', skillToInstall.name);
                       
                       const testResult = await skillInstaller.installAndTest(skillToInstall);
                       
@@ -5670,7 +6282,7 @@ const YueliCopilot: React.FC<YueliCopilotProps> = ({ debugModeEnabled, onToggleD
                       }
                       
                     } catch (error) {
-                      console.error('安装技能失败:', error);
+                      devError('安装技能失败:', error);
                       alert('安装技能失败，请检查URL是否正确');
                     } finally {
                       setIsInstallingFromUrl(false);
